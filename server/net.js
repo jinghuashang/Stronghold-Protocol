@@ -611,7 +611,9 @@ export class Network {
     // account — that is what lets the title screen register or sign in before it has a nickname). A mail-sending
     // endpoint also draws from the heavy bucket: one socket cannot turn 40 requests a second into 40 e-mails.
     if (msg.t.startsWith('auth.')) {
-      if (msg.t === 'auth.requestCode' && !conn.heavy.take(now)) { this.reply(conn, errorMsg(ERR.RATE, rid, `${msg.t} too often`)); return; }
+      // `auth.requestReset` mails a code too, so it is heavy for the same reason.
+      const heavy = msg.t === 'auth.requestCode' || msg.t === 'auth.requestReset';
+      if (heavy && !conn.heavy.take(now)) { this.reply(conn, errorMsg(ERR.RATE, rid, `${msg.t} too often`)); return; }
       void this.onAuthMsg(conn, msg).catch((e) => this.log.error('[net] auth handler crashed', e));
       return;
     }
@@ -770,13 +772,24 @@ export class Network {
       return;
     }
 
+    // Password reset (DESIGN §25.8): the same two steps against a `reset` code, which is kept apart from a
+    // registration code — and a successful reset is a login (fresh token, every older one revoked).
+    if (msg.t === 'auth.requestReset') {
+      const res = await accounts.requestResetCode(msg.email, { ip: conn.ip });
+      if (!res.ok) { out({ t: 'auth.error', code: res.error, message: res.error }); return; }
+      out({ t: 'auth.resetSent', email: String(msg.email).trim().toLowerCase(), ttlSec: res.ttlSec });
+      return;
+    }
+
     // register/login. A registration always claims a *new* playerId, so a session that holds a seat could never take it
     // — refuse before the account is created (a login as the very same account is fine, hence the check after it).
     let session = conn.session;
     if (msg.t === 'auth.register' && session && session.roomCode) { out({ t: 'auth.error', code: 'in_room', message: 'leave the room before signing in' }); return; }
     const res = msg.t === 'auth.register'
       ? await accounts.register({ email: msg.email, code: msg.code, name: msg.name, password: msg.password })
-      : await accounts.login({ email: msg.email, password: msg.password });
+      : msg.t === 'auth.resetPassword'
+        ? await accounts.resetPassword({ email: msg.email, code: msg.code, password: msg.password })
+        : await accounts.login({ email: msg.email, password: msg.password });
     if (!res.ok) { out({ t: 'auth.error', code: res.error, message: res.error }); return; }
     if (!session) {
       session = this.registry.create(res.name);

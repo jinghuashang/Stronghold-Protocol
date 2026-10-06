@@ -94,6 +94,7 @@ export class NetError extends Error {
  */
 export const AUTH_ERR_TEXT = Object.freeze(Object.assign(Object.create(null), {
   email_taken: '该邮箱已注册，请直接登录',
+  unknown_email: '该邮箱没有注册过账号，请检查或先注册',
   bad_email: '请输入有效的邮箱地址',
   bad_code: '验证码不正确',
   code_expired: '验证码已失效，请重新获取',

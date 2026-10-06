@@ -21,6 +21,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { startServer } from '../../server/index.js';
+import { createAccounts } from '../../server/accounts.js';
+import { createSmtp } from '../../server/smtp.js';
+import { ACCOUNT } from '../../shared/protocol.js';
 import { StubMatch } from '../../server/match/StubMatch.js';
 import { TestClient } from '../helpers/wsClient.js';
 
@@ -68,6 +71,16 @@ function fakeRelay() {
     });
   });
   return { mails, server, close: () => new Promise((r) => server.close(() => r())) };
+}
+
+/** What a mail client shows: the RFC 2047 subject and the base64 body, decoded. */
+function mailText(mail) {
+  const [headers, ...rest] = mail.split('\r\n\r\n');
+  const subject = (headers.match(/^Subject: (.*)$/m) || [])[1] || '';
+  const words = [...subject.matchAll(/=\?UTF-8\?B\?([^?]+)\?=/g)].map((m) => m[1]).join('');
+  const plain = words ? Buffer.from(words, 'base64').toString('utf8') : subject;
+  const body = Buffer.from(rest.join('\r\n\r\n').replace(/\r\n/g, ''), 'base64').toString('utf8');
+  return `${plain}\n${body}`;
 }
 
 /** The 6-digit code of the newest mail, read exactly as a player would (the base64 body). */
@@ -261,6 +274,61 @@ describe('accounts end to end (wired server)', () => {
     const r = spawnSync(process.execPath, [path.join(ROOT, 'server', 'index.js')], { env, encoding: 'utf8', timeout: 3000, killSignal: 'SIGKILL' });
     assert.equal(r.status, null, 'still running when the test killed it — it did not exit on its own');
     assert.match(r.stdout + r.stderr, /\[accounts\] OFF/);
+  });
+
+  test('找回密码 end to end: a reset code by mail → resetPassword → auth.ok + welcome, every older session cut off', async () => {
+    // Its own server (and its own store with a controllable clock): the mail throttles are per address and per hour, and
+    // a test must not sit 60 s waiting for them — everything else (the real SMTP client, the mail, the protocol) is real.
+    const clock = { now: Date.now() };
+    const EMAIL3 = 'amya@rhodes.example';
+    const store = createAccounts({
+      file: path.join(tmp, 'reset.json'), log: cap.log, now: () => clock.now,
+      smtp: createSmtp({ host: '127.0.0.1', port: relayPort, from: 'noreply@stronghold.example' }),
+    });
+    const srv2 = await startServer({
+      port: 0, host: '127.0.0.1', log: cap.log, MatchClass: StubMatch, accounts: store,
+      env: { ACCOUNTS: 'on', SMTP_HOST: '127.0.0.1', SMTP_PORT: String(relayPort), SMTP_FROM: 'noreply@stronghold.example' },
+    });
+    const url2 = `ws://127.0.0.1:${srv2.port}/ws`;
+    try {
+      const owner = await TestClient.connect(url2);
+      const registered = await auth(owner, { t: 'auth.requestCode', email: EMAIL3 }, 'auth.codeSent');
+      assert.equal(registered.ttlSec, 600);
+      const registered2 = await auth(owner, { t: 'auth.register', email: EMAIL3, code: latestCode(relay), name: '阿米娅', password: PASSWORD }, 'auth.ok');
+      await owner.waitFor('welcome', (m) => m.playerId === registered2.playerId);
+      // a second device signed in on the same account (both hold tokens)
+      const other = await TestClient.connect(url2);
+      const logged = await auth(other, { t: 'auth.login', email: EMAIL3, password: PASSWORD }, 'auth.ok');
+      assert.equal(logged.playerId, registered2.playerId);
+      await other.waitFor('welcome', (m) => m.playerId === logged.playerId);
+      assert.equal(store.stats().tokens, 2, 'two devices hold a token');
+
+      // the reset itself (its own connection, signed out: a forgotten password is exactly this)
+      clock.now += ACCOUNT.resendSec * 1000 + 1000; // past the one-mail-a-minute window
+      const stranger = await TestClient.connect(url2);
+      const sent = await auth(stranger, { t: 'auth.requestReset', email: EMAIL3 }, 'auth.resetSent');
+      assert.equal(sent.email, EMAIL3);
+      assert.equal(sent.ttlSec, 600);
+      const resetMail = relay.mails[relay.mails.length - 1];
+      assert.match(mailText(resetMail), /密码重置验证码/, 'the reset mail, not a registration one');
+      const code = latestCode(relay);
+      const reset = await auth(stranger, { t: 'auth.resetPassword', email: EMAIL3, code, password: 'new-pass-9!' }, 'auth.ok');
+      assert.equal(reset.playerId, registered2.playerId, 'the same account, a fresh session');
+      await stranger.waitFor('welcome', (m) => m.playerId === reset.playerId);
+
+      // every device that was signed in is cut off; the resetting one is the only session left
+      const cutOff = await other.closed;
+      assert.equal(cutOff.code, 4001, 'the other device is disconnected');
+      assert.equal(await owner.closed.then((e) => e.code), 4001, 'and so is the first one');
+      assert.equal(store.stats().tokens, 1, 'only the token the reset answered with survives');
+      const old = await auth(await TestClient.connect(url2), { t: 'auth.login', email: EMAIL3, password: PASSWORD }, 'auth.error');
+      assert.equal(old.code, 'bad_credentials', 'the old password is gone');
+      const fresh = await auth(await TestClient.connect(url2), { t: 'auth.login', email: EMAIL3, password: 'new-pass-9!' }, 'auth.ok');
+      assert.equal(fresh.playerId, reset.playerId, 'the new password signs in');
+      await stranger.close();
+    } finally {
+      await srv2.close();
+    }
   });
 
   test('nothing was logged as an error while the wired feature ran', () => {

@@ -58,6 +58,15 @@ async function codeFor(ctx, email = EMAIL) {
   return code;
 }
 
+/** Request a *reset* code and return it (the 忘记密码 flow). */
+async function codeForReset(ctx, email = EMAIL) {
+  const res = await ctx.accounts.requestResetCode(email);
+  assert.equal(res.ok, true, JSON.stringify(res));
+  const code = ctx.mail.code();
+  assert.match(code, /^[0-9]{6}$/, 'the mail carries the code');
+  return code;
+}
+
 /** Register through the real two-step flow. */
 async function signUp(ctx, { email = EMAIL, name = '阿米娅', password = PASSWORD } = {}) {
   const code = await codeFor(ctx, email);
@@ -240,6 +249,116 @@ describe('accounts: e-mail verification codes', () => {
     assert.notEqual(first, second);
     assert.deepEqual(ctx.accounts.verifyCode(EMAIL, first), { ok: false, error: 'bad_code' });
     assert.deepEqual(ctx.accounts.verifyCode(EMAIL, second), { ok: true });
+  });
+});
+
+describe('accounts: password reset (找回密码)', () => {
+  test('a reset code goes to an existing address only, and reads as a reset mail', async () => {
+    const ctx = mk();
+    assert.deepEqual(await ctx.accounts.requestResetCode('nobody@rhodes.example'), { ok: false, error: 'unknown_email' });
+    assert.deepEqual(await ctx.accounts.requestResetCode('nope'), { ok: false, error: 'bad_email' });
+    assert.equal(ctx.mail.mails.length, 0, 'no mail for an address without an account');
+    await signUp(ctx);
+    ctx.clock.now += ACCOUNT.resendSec * 1000;
+    const res = await ctx.accounts.requestResetCode(EMAIL);
+    assert.deepEqual(res, { ok: true, ttlSec: ACCOUNT.codeTtlSec });
+    const mail = ctx.mail.mails[ctx.mail.mails.length - 1];
+    assert.equal(mail.to, EMAIL);
+    assert.match(mail.subject, /密码重置验证码/);
+    assert.match(mail.text, /你的密码重置验证码是：[0-9]{6}/);
+    assert.match(mail.text, /如果你没有请求重置，请忽略这封邮件/);
+    assert.deepEqual(ctx.accounts.stats().accounts, 1);
+  });
+
+  test('the two purposes are isolated: a registration code never resets, a reset code never registers', async () => {
+    const ctx = mk();
+    const registerCode = await codeFor(ctx);                 // a pending registration code
+    ctx.clock.now += ACCOUNT.resendSec * 1000;
+    await ctx.accounts.requestResetCode(EMAIL).then((r) => assert.equal(r.ok, false, 'no account yet'));
+    // register with the registration code
+    const reg = await ctx.accounts.register({ email: EMAIL, code: registerCode, name: '阿米娅', password: PASSWORD });
+    assert.equal(reg.ok, true);
+    // a registration code for this address cannot exist any more (the address is taken), so the reset code is the only
+    // one left: a *registration* attempt with a reset code is refused by the address check first…
+    ctx.clock.now += ACCOUNT.resendSec * 1000;
+    const resetCode = await codeForReset(ctx);
+    assert.deepEqual(await ctx.accounts.register({ email: EMAIL, code: resetCode, name: '凯尔希', password: PASSWORD }), { ok: false, error: 'code_expired' });
+    // …and a *reset* attempt with a registration code (a fresh one for another address) is refused by purpose
+    ctx.clock.now += ACCOUNT.resendSec * 1000;
+    const other = await ctx.accounts.requestCode('other@rhodes.example');
+    assert.equal(other.ok, true);
+    const otherRegisterCode = ctx.mail.code();
+    assert.deepEqual(await ctx.accounts.resetPassword({ email: 'other@rhodes.example', code: otherRegisterCode, password: 'new-password' }), { ok: false, error: 'code_expired' });
+    assert.deepEqual(await ctx.accounts.resetPassword({ email: EMAIL, code: otherRegisterCode, password: 'new-password' }), { ok: false, error: 'bad_code' }, 'a registration code is not a reset code (the pending reset code is the only thing that would match)');
+    assert.equal((await ctx.accounts.resetPassword({ email: EMAIL, code: resetCode, password: 'new-password' })).ok, true, 'the reset code still works');
+  });
+
+  test('a reset changes the password, revokes every token and answers a fresh one (the reset is a login)', async () => {
+    const ctx = mk();
+    const reg = await signUp(ctx);
+    const phone = await ctx.accounts.login({ email: EMAIL, password: PASSWORD });
+    const desktop = await ctx.accounts.login({ email: EMAIL, password: PASSWORD });
+    assert.deepEqual(ctx.accounts.stats().tokens, 3);
+    ctx.clock.now += ACCOUNT.resendSec * 1000;
+    const code = await codeForReset(ctx);
+    const reset = await ctx.accounts.resetPassword({ email: EMAIL, code, password: 'new-pass-9!' });
+    assert.equal(reset.ok, true, JSON.stringify(reset));
+    assert.equal(reset.playerId, reg.playerId);
+    assert.equal(reset.name, reg.name);
+    assert.deepEqual(ctx.accounts.stats(), { accounts: 1, tokens: 1, codes: 0 }, 'one token survives: the new one');
+    for (const old of [reg.token, phone.token, desktop.token]) assert.equal(ctx.accounts.verify(old), null, 'every older device is signed out');
+    assert.deepEqual(ctx.accounts.verify(reset.token), { playerId: reg.playerId, name: '阿米娅', email: EMAIL });
+    assert.equal((await ctx.accounts.login({ email: EMAIL, password: PASSWORD })).ok, false, 'the old password is gone');
+    assert.equal((await ctx.accounts.login({ email: EMAIL, password: 'new-pass-9!' })).ok, true, 'the new one works');
+    // the code is one-use
+    assert.deepEqual(await ctx.accounts.resetPassword({ email: EMAIL, code, password: 'another-1' }), { ok: false, error: 'code_expired' });
+  });
+
+  test('a reset code expires, is voided by five wrong tries, and obeys the same throttles', async () => {
+    const ctx = mk();
+    await signUp(ctx);
+    ctx.clock.now += ACCOUNT.resendSec * 1000;
+    const code = await codeForReset(ctx);
+    const wrong = code === '000000' ? '111111' : '000000';
+    ctx.clock.now += ACCOUNT.codeTtlSec * 1000 + 1;
+    assert.deepEqual(await ctx.accounts.resetPassword({ email: EMAIL, code, password: 'new-pass-9!' }), { ok: false, error: 'code_expired' }, 'expired');
+    ctx.clock.now -= ACCOUNT.codeTtlSec * 1000 + 1;
+    ctx.clock.now += ACCOUNT.resendSec * 1000;
+    const fresh = await codeForReset(ctx);
+    for (let i = 1; i < ACCOUNT.codeTries; i++) {
+      assert.deepEqual(await ctx.accounts.resetPassword({ email: EMAIL, code: wrong, password: 'new-pass-9!' }), { ok: false, error: 'bad_code' }, `try ${i}`);
+    }
+    assert.deepEqual(await ctx.accounts.resetPassword({ email: EMAIL, code: wrong, password: 'new-pass-9!' }), { ok: false, error: 'code_expired' }, 'voided');
+    assert.deepEqual(await ctx.accounts.resetPassword({ email: EMAIL, code: fresh, password: 'new-pass-9!' }), { ok: false, error: 'code_expired' }, 'the right code is void too');
+    // throttles: one mail a minute, five an hour, and a weak password is refused before the code is spent
+    ctx.clock.now += ACCOUNT.resendSec * 1000;
+    assert.equal((await ctx.accounts.requestResetCode(EMAIL)).ok, true);
+    assert.deepEqual(await ctx.accounts.requestResetCode(EMAIL), { ok: false, error: 'too_many' });
+    const last = ctx.mail.code();
+    assert.deepEqual(await ctx.accounts.resetPassword({ email: EMAIL, code: last, password: 'short' }), { ok: false, error: 'bad_password' });
+    assert.equal((await ctx.accounts.resetPassword({ email: EMAIL, code: last, password: 'long-enough-1' })).ok, true, 'the code is still there after a bad password');
+    // no SMTP configured: nothing works
+    const off = mk({ smtp: null });
+    assert.deepEqual(await off.accounts.requestResetCode(EMAIL), { ok: false, error: 'accounts_disabled' });
+    assert.deepEqual(await off.accounts.resetPassword({ email: EMAIL, code: '123456', password: 'long-enough-1' }), { ok: false, error: 'accounts_disabled' });
+  });
+
+  test('a reset is recorded in the file (salt/hash replaced, no plaintext) and survives a reload', async () => {
+    const ctx = mk();
+    await signUp(ctx);
+    const before = readFileSync(ctx.file, 'utf8');
+    ctx.clock.now += ACCOUNT.resendSec * 1000;
+    const code = await codeForReset(ctx);
+    const reset = await ctx.accounts.resetPassword({ email: EMAIL, code, password: 'new-pass-9!' });
+    assert.equal(reset.ok, true);
+    ctx.accounts.flush();
+    const raw = readFileSync(ctx.file, 'utf8');
+    assert.notEqual(raw, before, 'the store was rewritten');
+    assert.ok(!raw.includes('new-pass-9!'), 'no plaintext password');
+    assert.ok(!raw.includes(reset.token), 'no plaintext token');
+    const reloaded = createAccounts({ file: ctx.file, smtp: fakeMailer(), log: { info() {}, warn() {}, error() {}, debug() {} }, now: () => ctx.clock.now });
+    assert.deepEqual(reloaded.verify(reset.token), { playerId: reset.playerId, name: '阿米娅', email: EMAIL });
+    assert.equal((await reloaded.login({ email: EMAIL, password: 'new-pass-9!' })).ok, true);
   });
 });
 

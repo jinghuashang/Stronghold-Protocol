@@ -299,6 +299,10 @@ export const C2S = {
   'auth.requestCode': { email: isEmail },
   'auth.register': { email: isEmail, code: isCode, name: isNewName, password: isNewPassword },
   'auth.login': { email: isEmail, password: isLoginPassword },
+  // password reset (§25.8): a `reset` code mailed to the account's address. Codes are isolated by purpose, so a
+  // registration code can never reset a password; a successful reset revokes every token of the account.
+  'auth.requestReset': { email: isEmail },
+  'auth.resetPassword': { email: isEmail, code: isCode, password: isNewPassword },
   'auth.logout': {},
   'room.create': { mode: (v) => v === 'solo' || v === 'coop', difficulty: (v) => DIFFICULTIES.includes(v) },
   'room.join': { code: (v) => isStr(v, ROOM_CODE_LEN + 2) && /^[A-Za-z0-9]+$/.test(v) },
@@ -368,13 +372,14 @@ export const C2S = {
 // Server → client message types (documentation + client dispatch table keys).
 export const S2C = [
   'welcome', 'ok', 'error', 'pong',
-  // accounts (server/accounts.js, DESIGN §25): auth.codeSent { email, ttlSec } — the verification code is on its way;
-  // auth.ok { playerId, name, token } — the account is bound to this session (token = the account token, the session's
-  // own reconnect token still arrives in `welcome`); auth.error { code, message } — refused (carries the request's rid
-  // when it answers an auth.* request, none at all when a `hello.auth` token was not recognised: the hello itself is
-  // then served as a guest). Codes: code_sent | bad_code | code_expired | too_many | email_taken | bad_email |
-  // bad_name | bad_password | bad_credentials | accounts_disabled | smtp_failed | in_room | no_session | bad_token.
-  'auth.codeSent', 'auth.ok', 'auth.error',
+  // accounts (server/accounts.js, DESIGN §25): auth.codeSent { email, ttlSec } — a registration code is on its way;
+  // auth.resetSent { email, ttlSec } — the same for a password reset; auth.ok { playerId, name, token } — the account
+  // is bound to this session (token = the account token, the session's own reconnect token still arrives in `welcome`);
+  // auth.error { code, message } — refused (carries the request's rid when it answers an auth.* request, none at all
+  // when a `hello.auth` token was not recognised: the hello itself is then served as a guest). Codes: code_sent |
+  // bad_code | code_expired | too_many | email_taken | unknown_email | bad_email | bad_name | bad_password |
+  // bad_credentials | accounts_disabled | smtp_failed | in_room | no_session | bad_token.
+  'auth.codeSent', 'auth.resetSent', 'auth.ok', 'auth.error',
   'room.state', 'room.closed',
   'm.public', 'm.private', 'm.field', 'm.toast', 'm.ticker', 'm.emote', 'm.result',
   // m.unitStats { seq, round, units: [unitStatsEntry] } — the answer to g.unitStats (the requester only)

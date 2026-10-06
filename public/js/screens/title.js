@@ -248,7 +248,7 @@ function CodeField({ value, onInput, onEnter, disabled, invalid }) {
 /** Big, centred 6-digit message: the one line the mail carries. */
 const CODE_SENT_TEXT = (ttlSec) => `验证码已发送（${Math.round(ttlSec / 60)} 分钟内有效）`;
 
-const AUTH_MODE = { LOGIN: 'login', REGISTER: 'register' };
+const AUTH_MODE = { LOGIN: 'login', REGISTER: 'register', RESET: 'reset' };
 
 /**
  * Account panel under 开始 (server/accounts.js, DESIGN §25): 账号登录 (e-mail + password) or 注册 in two steps —
@@ -301,14 +301,15 @@ function AuthPanel({ name, autoFocusPassword = false }) {
     toast('已退出账号，将以游客身份开始', 'info');
   };
 
-  /** Step 1: mail a code to the address in the field. */
+  /** Step 1 (both flows): mail a code to the address in the field — a registration or a password-reset one. */
   const sendCode = async () => {
     if (busy) return;
     if (!emailOk) { setError(authErrorText('bad_email')); return; }
+    const reset = mode === AUTH_MODE.RESET;
     setBusy(true);
     setError('');
     try {
-      const res = await net.request('auth.requestCode', { email: address }, { session: false });
+      const res = await net.request(reset ? 'auth.requestReset' : 'auth.requestCode', { email: address }, { session: false });
       setSentEmail(res?.email ? String(res.email) : address);
       setCode('');
       setWait(ACCOUNT.resendSec);
@@ -319,7 +320,7 @@ function AuthPanel({ name, autoFocusPassword = false }) {
     }
   };
 
-  /** Step 2: prove the address, name the account and set a password. */
+  /** Step 2 of 注册: prove the address, name the account and set a password. */
   const submitRegister = async () => {
     if (busy) return;
     if (!sentEmail) { setError(authErrorText('bad_email')); return; }
@@ -336,6 +337,27 @@ function AuthPanel({ name, autoFocusPassword = false }) {
       setOpen(false);
       setSentEmail('');
       toast(`注册成功，已登录：${msg.name}`, 'success');
+    } catch (err) {
+      setError(authErrorText(err?.code, err?.serverMsg || err?.message));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Step 2 of 忘记密码: prove the address, set a new password — and the answer is a login (every old token is gone). */
+  const submitReset = async () => {
+    if (busy) return;
+    if (!sentEmail) { setError(authErrorText('bad_email')); return; }
+    if (!codeOk) { setError(authErrorText('bad_code')); return; }
+    if ([...password].length < ACCOUNT.passwordMin) { setError(authErrorText('bad_password')); return; }
+    setBusy(true);
+    setError('');
+    try {
+      const msg = await net.request('auth.resetPassword', { email: sentEmail, code, password }, { session: false });
+      reset();
+      setOpen(false);
+      setSentEmail('');
+      toast(`密码已重置，已登录：${msg.name}`, 'success');
     } catch (err) {
       setError(authErrorText(err?.code, err?.serverMsg || err?.message));
     } finally {
@@ -366,7 +388,12 @@ function AuthPanel({ name, autoFocusPassword = false }) {
   if (accountsOff) return html`<${MicroLabel}>当前服务器未开启账号系统，请以游客身份开始<//>`;
 
   const rowStyle = 'display:flex;align-items:center;gap:.08rem';
-  const registerStep2 = mode === AUTH_MODE.REGISTER && !!sentEmail;
+  const isRegister = mode === AUTH_MODE.REGISTER;
+  const isReset = mode === AUTH_MODE.RESET;
+  const codeFlow = isRegister || isReset;
+  const step2 = codeFlow && !!sentEmail;
+  const step1Label = isReset ? '发送重置码' : '发送验证码';
+  const submitStep2 = isReset ? submitReset : submitRegister;
   return html`<div style="display:flex;flex-direction:column;gap:.1rem">
     ${account ? html`<div style=${rowStyle}>
       <span class="status-dot is-on"></span>
@@ -377,7 +404,7 @@ function AuthPanel({ name, autoFocusPassword = false }) {
     </div>` : html`<div style=${rowStyle}>
       <${Button} size="sm" variant="ghost" block=${true} icon="key" active=${open && mode === AUTH_MODE.LOGIN}
         onClick=${() => pick(AUTH_MODE.LOGIN)}>账号登录<//>
-      <${Button} size="sm" variant="ghost" block=${true} icon="plus" active=${open && mode === AUTH_MODE.REGISTER}
+      <${Button} size="sm" variant="ghost" block=${true} icon="plus" active=${open && isRegister}
         onClick=${() => pick(AUTH_MODE.REGISTER)}>注册<//>
     </div>`}
 
@@ -387,22 +414,31 @@ function AuthPanel({ name, autoFocusPassword = false }) {
       disabled=${busy} invalid=${!!error} autoComplete="current-password" onInput=${setPassword} onEnter=${submitLogin} />` : null}
     ${!account && open && mode === AUTH_MODE.LOGIN ? html`<${Button} variant="secondary" size="md" block=${true} loading=${busy}
       icon="check" disabled=${busy || !emailOk || !password} onClick=${submitLogin}>登录<//>` : null}
+    ${!account && open && mode === AUTH_MODE.LOGIN ? html`<div style=${rowStyle}>
+      <${Button} size="sm" variant="ghost" onClick=${() => pick(AUTH_MODE.RESET)}>忘记密码<//>
+      <span style="flex:1"></span>
+      <${MicroLabel}>用邮箱重置密码，无需旧密码<//>
+    </div>` : null}
 
-    ${!account && open && mode === AUTH_MODE.REGISTER ? html`<${EmailField} value=${email} disabled=${busy}
+    ${!account && open && codeFlow ? html`<${EmailField} value=${email} disabled=${busy}
       invalid=${!!error} autoFocus=${autoFocusPassword} onInput=${setEmail} onEnter=${sendCode} />` : null}
-    ${!account && open && mode === AUTH_MODE.REGISTER ? html`<${Button} variant=${registerStep2 ? 'ghost' : 'secondary'} size="md"
-      block=${true} loading=${busy && !registerStep2} icon=${registerStep2 ? 'refresh' : 'key'} disabled=${busy || !emailOk || wait > 0}
-      onClick=${sendCode}>${registerStep2 ? (wait > 0 ? `重发（${wait}s）` : '重新发送验证码') : '发送验证码'}<//>` : null}
-    ${!account && open && registerStep2 ? html`<${MicroLabel}>${CODE_SENT_TEXT(ACCOUNT.codeTtlSec)}<//>` : null}
-    ${!account && open && registerStep2 ? html`<${CodeField} value=${code} disabled=${busy} invalid=${!!error}
-      onInput=${setCode} onEnter=${submitRegister} />` : null}
-    ${!account && open && registerStep2 ? html`<${PasswordField} value=${password} micro="NEW PASSWORD"
-      disabled=${busy} invalid=${!!error} autoComplete="new-password" onInput=${setPassword} onEnter=${submitRegister} />` : null}
-    ${!account && open && registerStep2 ? html`<${Button} variant="secondary" size="md" block=${true} loading=${busy}
-      icon="plus" disabled=${busy || !codeOk || !password} onClick=${submitRegister}>完成注册<//>` : null}
-    ${!account && open && registerStep2 ? html`<${MicroLabel}>昵称用上方的博士代号：${nickname || '（请先填写）'}<//>` : null}
-
-    ${!account && open && mode === AUTH_MODE.REGISTER ? html`<${MicroLabel}>注册后可在手机等设备上登录，继续同一局<//>` : null}
+    ${!account && open && codeFlow ? html`<${Button} variant=${step2 ? 'ghost' : 'secondary'} size="md"
+      block=${true} loading=${busy && !step2} icon=${step2 ? 'refresh' : 'key'} disabled=${busy || !emailOk || wait > 0}
+      onClick=${sendCode}>${step2 ? (wait > 0 ? `重发（${wait}s）` : '重新发送') : step1Label}<//>` : null}
+    ${!account && open && step2 ? html`<${MicroLabel}>${CODE_SENT_TEXT(ACCOUNT.codeTtlSec)}<//>` : null}
+    ${!account && open && step2 ? html`<${CodeField} value=${code} disabled=${busy} invalid=${!!error}
+      onInput=${setCode} onEnter=${submitStep2} />` : null}
+    ${!account && open && step2 ? html`<${PasswordField} value=${password} micro=${isReset ? 'NEW PASSWORD' : 'NEW PASSWORD'}
+      disabled=${busy} invalid=${!!error} autoComplete="new-password" onInput=${setPassword} onEnter=${submitStep2} />` : null}
+    ${!account && open && step2 ? html`<${Button} variant="secondary" size="md" block=${true} loading=${busy}
+      icon=${isReset ? 'refresh' : 'plus'} disabled=${busy || !codeOk || !password} onClick=${submitStep2}>${isReset ? '重置并登录' : '完成注册'}<//>` : null}
+    ${!account && open && step2 && isRegister ? html`<${MicroLabel}>昵称用上方的博士代号：${nickname || '（请先填写）'}<//>` : null}
+    ${!account && open && codeFlow ? html`<${MicroLabel}>${isReset
+      ? '重置成功后其他设备会全部退出登录，本机直接进入已登录状态'
+      : '注册后可在手机等设备上登录，继续同一局'}<//>` : null}
+    ${!account && open && codeFlow && isReset ? html`<div style=${rowStyle}>
+      <${Button} size="sm" variant="ghost" onClick=${() => pick(AUTH_MODE.LOGIN)}>返回登录<//>
+    </div>` : null}
     ${!account && open && mode === AUTH_MODE.LOGIN ? html`<${MicroLabel}>登录后可在其他设备接管当前同盟与对局<//>` : null}
     ${!account && !open ? html`<${MicroLabel}>账号可选：以游客身份也可直接开始<//>` : null}
     ${error ? html`<div style="font-size:.13rem;color:var(--red-premium);line-height:1.4">${error}</div>` : null}

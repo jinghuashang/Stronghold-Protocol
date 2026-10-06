@@ -20,6 +20,9 @@
 //      client address. An address that already has an account is refused here (`email_taken`) — the alternative is a
 //      user who goes through the whole flow only to be told at the end, and the register step discloses it anyway.
 //   2. `register({ email, code, name, password })` consumes the code, hashes the password, and answers a token.
+// The same machinery with `purpose: 'reset'` is the way back into an account (`requestResetCode` / `resetPassword`,
+// §25.8): codes of the two purposes are stored apart, so a registration code can never reset a password; a reset
+// revokes every token the account had — the other devices are signed out — and the reset itself is a login.
 // `login({ email, password })` needs no code; an unknown address and a wrong password answer the same
 // `bad_credentials`, and an unknown address still derives a key against a throwaway record so the reply time cannot
 // tell them apart.
@@ -172,9 +175,11 @@ const derive = (password, salt) => scrypt(password.normalize('NFC'), salt, SCRYP
  *   configured relay in server/index.js); `now` is injectable for tests.
  * @returns {{
  *   requestCode: (email: unknown, opts?: { ip?: string | null }) => Promise<{ ok: true, ttlSec: number } | { ok: false, error: string }>,
+ *   requestResetCode: (email: unknown, opts?: { ip?: string | null }) => Promise<{ ok: true, ttlSec: number } | { ok: false, error: string }>,
  *   verifyCode: (email: unknown, code: unknown) => { ok: true } | { ok: false, error: 'code_expired' | 'bad_code' | 'bad_email' },
  *   register: (input: { email: unknown, code: unknown, name: unknown, password: unknown }) => Promise<{ ok: true, playerId: string, token: string, name: string, email: string } | { ok: false, error: string }>,
  *   login: (input: { email: unknown, password: unknown }) => Promise<{ ok: true, playerId: string, token: string, name: string, email: string } | { ok: false, error: 'bad_credentials' }>,
+ *   resetPassword: (input: { email: unknown, code: unknown, password: unknown }) => Promise<{ ok: true, playerId: string, token: string, name: string, email: string } | { ok: false, error: string }>,
  *   logout: (token: unknown) => boolean,
  *   verify: (token: unknown) => { playerId: string, name: string, email: string } | null,
  *   stats: () => { accounts: number, tokens: number, codes: number },
@@ -227,8 +232,54 @@ export function createAccounts({ file = path.join(DATA_DIR, 'accounts.json'), sm
     if (ip) sentLog.set(`ip:${ip}`, [...sentWithinHour(`ip:${ip}`, at), at]);
   }
 
+  /** A pending code is keyed by purpose *and* address: a registration code and a reset code never touch each other. */
+  const codeKey = (email, purpose) => `${purpose}:${email}`;
+
   /**
-   * Mail one verification code. The only place the relay is used; failures are `smtp_failed` and never throw.
+   * Mail one verification code for a purpose ('register' | 'reset') and remember only its hash. The only place the
+   * relay is used; a failure is `smtp_failed` and never throws.
+   * @param {string} email normalized
+   * @param {'register' | 'reset'} purpose
+   * @param {string | null} ip
+   * @returns {Promise<{ ok: true, ttlSec: number } | { ok: false, error: string }>}
+   */
+  async function mailCode(email, purpose, ip) {
+    const at = now();
+    const reason = throttled(email, ip, at);
+    if (reason) {
+      log.info(`[accounts] ${purpose} code for ${email} throttled (${reason})`);
+      return { ok: false, error: 'too_many' };
+    }
+    const code = String(randomInt(0, 10 ** ACCOUNT.codeLength)).padStart(ACCOUNT.codeLength, '0');
+    const salt = randomBytes(16);
+    const ttlSec = ACCOUNT.codeTtlSec;
+    const minutes = Math.round(ttlSec / 60);
+    const mail = purpose === 'reset'
+      ? {
+        subject: `[卫戍协议：盟约] 密码重置验证码 ${code}`,
+        text: `你的密码重置验证码是：${code}（${minutes} 分钟内有效；如果你没有请求重置，请忽略这封邮件）`,
+      }
+      : {
+        subject: `[卫戍协议：盟约] 注册验证码 ${code}`,
+        text: `你的注册验证码是：${code}\n\n${minutes} 分钟内有效，请勿泄露给他人。\n如果你没有请求过注册，请忽略这封邮件。\n\n— Stronghold Protocol: Alliance`,
+      };
+    try {
+      await smtp.send({ to: email, ...mail });
+    } catch (err) {
+      // Nothing was sent and nothing is stored: the player may retry at once (the 60 s window only starts with a mail
+      // that actually left), while the attempt still counts against the hourly budget checked above.
+      log.error(`[accounts] could not mail a ${purpose} code to ${email}: ${err?.message}`);
+      return { ok: false, error: 'smtp_failed' };
+    }
+    codes.set(codeKey(email, purpose), { hash: codeHash(code, salt), salt, purpose, expiresAt: at + ttlSec * 1000, tries: 0 });
+    noteSent(email, ip, at);
+    log.info(`[accounts] ${purpose} code sent to ${email}`);
+    return { ok: true, ttlSec };
+  }
+
+  /**
+   * Mail a registration code. An address that already has an account is refused here (`email_taken`): the alternative
+   * is a user who goes through the whole flow only to be told at the end, and the register step discloses it anyway.
    * @param {unknown} rawEmail @param {{ ip?: string | null }} [opts]
    * @returns {Promise<{ ok: true, ttlSec: number } | { ok: false, error: string }>}
    */
@@ -236,46 +287,40 @@ export function createAccounts({ file = path.join(DATA_DIR, 'accounts.json'), sm
     const email = normalizeEmail(rawEmail);
     if (!email) return { ok: false, error: 'bad_email' };
     if (!smtp) return { ok: false, error: 'accounts_disabled' };
-    if (byEmail.has(email)) return { ok: false, error: 'email_taken' }; // the register step would say so anyway
-    const at = now();
-    const reason = throttled(email, ip, at);
-    if (reason) {
-      log.info(`[accounts] verification code for ${email} throttled (${reason})`);
-      return { ok: false, error: 'too_many' };
-    }
-    const code = String(randomInt(0, 10 ** ACCOUNT.codeLength)).padStart(ACCOUNT.codeLength, '0');
-    const salt = randomBytes(16);
-    const ttlSec = ACCOUNT.codeTtlSec;
-    try {
-      await smtp.send({
-        to: email,
-        subject: `[卫戍协议：盟约] 注册验证码 ${code}`,
-        text: `你的注册验证码是：${code}\n\n${Math.round(ttlSec / 60)} 分钟内有效，请勿泄露给他人。\n如果你没有请求过注册，请忽略这封邮件。\n\n— Stronghold Protocol: Alliance`,
-      });
-    } catch (err) {
-      // Nothing was sent and nothing is stored: the player may retry at once (the 60 s window only starts with a mail
-      // that actually left), while the attempt still counts against the hourly budget checked above.
-      log.error(`[accounts] could not mail a verification code to ${email}: ${err?.message}`);
-      return { ok: false, error: 'smtp_failed' };
-    }
-    codes.set(email, { hash: codeHash(code, salt), salt, expiresAt: at + ttlSec * 1000, tries: 0 });
-    noteSent(email, ip, at);
-    log.info(`[accounts] verification code sent to ${email}`);
-    return { ok: true, ttlSec };
+    if (byEmail.has(email)) return { ok: false, error: 'email_taken' };
+    return await mailCode(email, 'register', ip);
   }
 
   /**
-   * Check and consume a code. The code is one-use, expires, and five wrong tries void it (the fifth answer is
-   * `code_expired`: nothing is left to try).
-   * @param {unknown} rawEmail @param {unknown} rawCode
-   * @returns {{ ok: true } | { ok: false, error: 'code_expired' | 'bad_code' | 'bad_email' }}
+   * Mail a password-reset code. An address without an account answers `unknown_email` — [ASSUMED] deliberately, in the
+   * same style as registration's `email_taken`: telling somebody they have no account here is the honest answer, and
+   * the throttles (`too_many` after one mail a minute) plus the identical successful path keep it from being a useful
+   * account-enumeration oracle. A reset code and a registration code never share storage (see `codeKey`).
+   * @param {unknown} rawEmail @param {{ ip?: string | null }} [opts]
+   * @returns {Promise<{ ok: true, ttlSec: number } | { ok: false, error: string }>}
    */
-  function verifyCode(rawEmail, rawCode) {
+  async function requestResetCode(rawEmail, { ip = null } = {}) {
     const email = normalizeEmail(rawEmail);
     if (!email) return { ok: false, error: 'bad_email' };
-    const entry = codes.get(email);
-    if (!entry || entry.expiresAt <= now()) {
-      if (entry) codes.delete(email);
+    if (!smtp) return { ok: false, error: 'accounts_disabled' };
+    if (!byEmail.has(email)) return { ok: false, error: 'unknown_email' };
+    return await mailCode(email, 'reset', ip);
+  }
+
+  /**
+   * Check and consume a code of one purpose. The code is one-use, expires, and five wrong tries void it (the fifth
+   * answer is `code_expired`: nothing is left to try). A code of the other purpose simply cannot match — that is the
+   * isolation between registration and reset (a leaked registration code is not a way into an existing account).
+   * @param {unknown} rawEmail @param {unknown} rawCode @param {'register' | 'reset'} [purpose]
+   * @returns {{ ok: true } | { ok: false, error: 'code_expired' | 'bad_code' | 'bad_email' }}
+   */
+  function verifyCode(rawEmail, rawCode, purpose = 'register') {
+    const email = normalizeEmail(rawEmail);
+    if (!email) return { ok: false, error: 'bad_email' };
+    const key = codeKey(email, purpose);
+    const entry = codes.get(key);
+    if (!entry || entry.purpose !== purpose || entry.expiresAt <= now()) {
+      if (entry) codes.delete(key);
       return { ok: false, error: 'code_expired' };
     }
     const code = typeof rawCode === 'string' ? rawCode.trim() : '';
@@ -284,13 +329,13 @@ export function createAccounts({ file = path.join(DATA_DIR, 'accounts.json'), sm
     if (code.length !== ACCOUNT.codeLength || !timingSafeEqual(got, want)) {
       entry.tries += 1;
       if (entry.tries >= ACCOUNT.codeTries) {
-        codes.delete(email);
-        log.warn(`[accounts] verification code for ${email} voided after ${entry.tries} wrong tries`);
+        codes.delete(key);
+        log.warn(`[accounts] ${purpose} code for ${email} voided after ${entry.tries} wrong tries`);
         return { ok: false, error: 'code_expired' };
       }
       return { ok: false, error: 'bad_code' };
     }
-    codes.delete(email); // one use
+    codes.delete(key); // one use
     return { ok: true };
   }
 
@@ -465,6 +510,40 @@ export function createAccounts({ file = path.join(DATA_DIR, 'accounts.json'), sm
     return { ok: true, playerId: account.playerId, token, name: account.name, email: account.email };
   }
 
+  /**
+   * Reset a password with a mailed `reset` code (DESIGN §25.8): the code is consumed first, then the new password is
+   * hashed into a fresh salt, and **every token the account had is revoked** — a reset is the way back into an account
+   * whose password somebody else may know, so every other device is signed out (its next `hello` gets no session back)
+   * — and one fresh token is issued for the caller, which is what makes a reset a login.
+   * @param {{ email?: unknown, code?: unknown, password?: unknown }} input
+   * @returns {Promise<{ ok: true, playerId: string, token: string, name: string, email: string } | { ok: false, error: string }>}
+   */
+  async function resetPassword(input = {}) {
+    const { email: rawEmail, code, password } = input || {};
+    const email = normalizeEmail(rawEmail);
+    if (!email) return { ok: false, error: 'bad_email' };
+    if (!smtp) return { ok: false, error: 'accounts_disabled' };
+    if (!validAccountPassword(password)) return { ok: false, error: 'bad_password' };
+    const checked = verifyCode(email, code, 'reset');
+    if (!checked.ok) return { ok: false, error: checked.error };
+    const playerId = byEmail.get(email);
+    const account = playerId ? byId.get(playerId) : null;
+    if (!account) return { ok: false, error: 'code_expired' }; // the account went away between the mail and the code
+    const salt = randomBytes(16);
+    const hash = await derive(password, salt);
+    account.salt = salt.toString('base64');
+    account.hash = hash.toString('base64');
+    const revoked = account.tokens.length;
+    for (const t of account.tokens) byToken.delete(t.hash);
+    account.tokens = [];
+    const token = issueToken(account);
+    account.lastLoginAt = now();
+    account.lastSeenAt = account.lastLoginAt;
+    persist();
+    log.info(`[accounts] password reset for ${email} (${account.playerId}); ${revoked} token(s) revoked`);
+    return { ok: true, playerId: account.playerId, token, name: account.name, email: account.email };
+  }
+
   /** Revoke one token. @param {unknown} token @returns {boolean} whether it was a known, live token */
   function logout(token) {
     const hit = lookup(token);
@@ -499,5 +578,5 @@ export function createAccounts({ file = path.join(DATA_DIR, 'accounts.json'), sm
   }
 
   load();
-  return { requestCode, verifyCode, register, login, logout, verify, stats, flush, file, smtp };
+  return { requestCode, requestResetCode, verifyCode, register, login, resetPassword, logout, verify, stats, flush, file, smtp };
 }
