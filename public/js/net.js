@@ -5,13 +5,19 @@
 //   detects dead sockets (a ping left unanswered — no inbound frame at all — for DEAD_AFTER_MS ⇒
 //   close ⇒ reconnect). Measured from the oldest unanswered ping, not from the last inbound frame,
 //   so a background tab whose timers the browser throttles to ~1/min is not mistaken for dead.
-// - On every (re)connect, once a player name is known, sends `hello {name, token, version}`;
-//   the session is "online" after `welcome`.
+// - On every (re)connect, once a player name is known, sends `hello {name, token, version, auth?}`;
+//   the session is "online" after `welcome`. `auth` is the account token (server/accounts.js, DESIGN §25) when this
+//   browser is signed in: the server binds the session to the account's stable playerId, so the seat, room and match
+//   follow the account onto every device. Account intents (`auth.register` / `auth.login` / `auth.logout`) are
+//   ordinary requests answered by `auth.ok` / `auth.error`; an `auth.error` without a rid is an unsolicited refusal of
+//   the token this hello carried (a server that forgot it) — the app then forgets it too and stays a guest.
 // - `request(t, fields)` adds a `rid` and resolves on the matching `ok` (or any reply carrying the
 //   rid), rejects with a NetError on `error` or after REQUEST_TIMEOUT_MS. Requests made while
 //   reconnecting are queued and flushed after `welcome` (still bound by their timeout).
 // - Every server push is emitted by its `t` (see shared/protocol.js S2C) and as '*'.
-//   Extra events: 'status', 'ping', 'clock', 'helloError', 'unhandledError', 'replaced'.
+//   Extra events: 'status', 'ping', 'clock', 'helloError', 'unhandledError', 'replaced',
+//   'authUnsupported' (this server does not know the account intents: the hello is retried as a guest, see
+//   _onHelloError).
 // - Server close code 4001 ("session replaced": the same token connected from another tab) stops
 //   auto-reconnect (status 'closed', lastError REPLACED) so two tabs never fight over one session.
 // - Before a name is known (title screen) the socket only pings; the server closes such sockets
@@ -25,6 +31,8 @@
 // recent tokens in localStorage (resume after closing/reopening the tab). `identity.init()` asks
 // the other live tabs over a BroadcastChannel which tokens they hold, so a second or duplicated tab
 // of the same browser becomes a separate player instead of hijacking another tab's session.
+// Separately, an account token (server/accounts.js) is kept in localStorage by `saveAccountToken`
+// and travels in every `hello` as `auth`: any device that proves it becomes the same player.
 //
 // Shared modules are imported relatively: in the browser '../../shared/x.js' from /js/ resolves
 // to /shared/x.js (URL resolution clamps at the root); under Node it resolves to <repo>/shared.
@@ -79,6 +87,49 @@ export class NetError extends Error {
 }
 
 /**
+ * Player-facing text of an account failure (`auth.error { code, message }`, server/accounts.js error strings; DESIGN
+ * §25). The server's `message` is for the log — the player gets these. `BAD_MSG` is the *client* entry: a server that
+ * does not know the auth intents answers them with a protocol error, and the account panel degrades to a guest.
+ * Null-prototype: a code from the wire can never resolve to an Object.prototype member.
+ */
+export const AUTH_ERR_TEXT = Object.freeze(Object.assign(Object.create(null), {
+  email_taken: '该邮箱已注册，请直接登录',
+  bad_email: '请输入有效的邮箱地址',
+  bad_code: '验证码不正确',
+  code_expired: '验证码已失效，请重新获取',
+  too_many: '发送过于频繁，请稍后再试',
+  smtp_failed: '验证码邮件发送失败，请稍后再试',
+  accounts_disabled: '当前服务器未开启账号系统，请以游客身份开始',
+  bad_name: '代号需 3–12 字',
+  bad_password: '密码至少 6 位（最多 128 位）',
+  bad_credentials: '邮箱或密码不正确',
+  bad_token: '账号登录已失效，请重新登录',
+  no_session: '尚未连接到服务器，请稍后再试',
+  in_room: '请先离开同盟再登录账号',
+  BAD_MSG: '当前服务器不支持账号系统，请以游客身份开始',
+  OFFLINE: '未连接到服务器',
+  TIMEOUT: '服务器没有响应，请重试',
+}));
+
+/** @param {string} [code] @param {string} [fallback] server message @returns {string} */
+export const authErrorText = (code, fallback) =>
+  (typeof code === 'string' && Object.hasOwn(AUTH_ERR_TEXT, code) ? AUTH_ERR_TEXT[code] : null)
+  || (typeof fallback === 'string' && fallback)
+  || '登录失败，请重试';
+
+/**
+ * An account intent the server refused: `auth.error { code, message }` carrying the request's rid. Extends NetError so
+ * every existing error path (toastError, `instanceof NetError`) keeps working; `message` is already player-facing.
+ */
+export class AuthError extends NetError {
+  /** @param {string} code @param {string} [message] server text */
+  constructor(code, message) {
+    super(code, authErrorText(code, message));
+    this.name = 'AuthError';
+  }
+}
+
+/**
  * Reconnect delay for the n-th consecutive failed attempt (0-based), with ±jitter.
  * @param {number} attempt
  * @param {() => number} [rand]
@@ -113,6 +164,9 @@ export class Net {
    * @param {string} [opts.url] socket URL (default: derived from location at connect time)
    * @param {any} [opts.WebSocket] WebSocket constructor (default: globalThis.WebSocket)
    * @param {() => (string|null)} [opts.getToken] reconnect-token provider for `hello`
+   * @param {() => (string|null)} [opts.getAuth] account-token provider for `hello.auth` (server/accounts.js); null ⇒
+   *   a guest hello. Read on every hello, so a login that happens while the socket is open (or a logout that forgets
+   *   the token) is picked up by the next one.
    * @param {() => number} [opts.now]
    * @param {() => number} [opts.random]
    * @param {{setTimeout: Function, clearTimeout: Function, setInterval: Function, clearInterval: Function}} [opts.timers]
@@ -121,6 +175,7 @@ export class Net {
     this.url = opts.url || null;
     this.WS = opts.WebSocket || null;
     this.getToken = typeof opts.getToken === 'function' ? opts.getToken : () => null;
+    this.getAuth = typeof opts.getAuth === 'function' ? opts.getAuth : () => null;
     this.now = opts.now || (() => Date.now());
     this.random = opts.random || Math.random;
     this.timers = opts.timers || {
@@ -156,9 +211,16 @@ export class Net {
     this._helloTimer = null;
     this._helloRid = null;
     this._helloSentName = null;
+    this._helloSentAuth = false; // the hello we sent carried an account token (see _onHelloError)
     this._lastRx = 0;
     this._unansweredSince = null; // time of the oldest ping sent since the last inbound frame
     this._clockSamples = [];   // [{ offset, rtt }]
+    /**
+     * Whether this server knows the account intents (server/accounts.js): null until one answers, false once a
+     * BAD_MSG-hello retry proved it does not (`_onHelloError`). Never reset: it describes the server, not the socket.
+     * @type {boolean | null}
+     */
+    this.authSupported = null;
   }
 
   // ---- events ----------------------------------------------------------------------------------
@@ -296,6 +358,9 @@ export class Net {
     } else {
       this.attempt = 0;
       this._setStatus('connected');
+      // Only session-less intents (auth.requestCode) can be queued without a name: send them now, so the title does
+      // not wait for a handshake it will never start (`_flushQueue` runs after `welcome` when a hello is on its way).
+      this._flushQueue();
       this._sendPing();
     }
   }
@@ -347,6 +412,7 @@ export class Net {
     this._clearTimer('_helloTimer', 'clearTimeout');
     this._helloRid = null;
     this._helloSentName = null;
+    this._helloSentAuth = false;
   }
 
   _clearTimer(field, fn) {
@@ -364,7 +430,14 @@ export class Net {
     const msg = { t: 'hello', rid, name: this.name, version: PROTOCOL_VERSION };
     let token = null;
     try { token = this.getToken(); } catch { token = null; }
-    if (typeof token === 'string' && token.length > 0 && token.length <= 64) msg.token = token;
+    if (typeof token === 'string' && token.length > 0 && token.length <= TOKEN_MAX_LEN) msg.token = token;
+    // An account token proves the account on this socket: the server binds the session to the account's stable
+    // playerId (taking over the session this account already has elsewhere — that is the multi-device hand-over).
+    // Skipped once the server has told us it does not know the field (`_onHelloError` below, a server older than
+    // accounts): the retried hello must be exactly the guest hello such a server accepts.
+    let auth = null;
+    if (this.authSupported !== false) { try { auth = this.getAuth(); } catch { auth = null; } }
+    if (typeof auth === 'string' && auth.length > 0 && auth.length <= TOKEN_MAX_LEN) { msg.auth = auth; this._helloSentAuth = true; } else this._helloSentAuth = false;
     this._helloRid = rid;
     this._helloSentName = this.name;
     if (this.status !== 'handshaking') this._setStatus('handshaking');
@@ -400,6 +473,17 @@ export class Net {
   _onHelloError(msg) {
     this._clearTimer('_helloTimer', 'clearTimeout');
     this._helloRid = null;
+    // A server older than accounts rejects the extra `hello.auth` field (BAD_MSG: bad field auth). Say hello again
+    // without it — the guest session this player would have had anyway — instead of leaving them stuck at the title
+    // with an error toast. Queued requests stay queued for the retry. `authUnsupported` lets the UI stop claiming an
+    // account no server here can honour (the token itself is kept: a later server may know it again).
+    if (this._helloSentAuth && this.authSupported === null && msg?.code === 'BAD_MSG') {
+      this.authSupported = false;
+      this._helloSentAuth = false;
+      this._emit('authUnsupported', this.lastError || new NetError(msg.code, msg.msg, msg.detail));
+      this._sendHello();
+      return;
+    }
     this.lastError = new NetError(msg.code, msg.msg, msg.detail);
     this._setStatus('connected');
     // Queued requests can't be sent without a session.
@@ -415,17 +499,20 @@ export class Net {
   }
 
   /**
-   * Send a request and wait for its `ok` (resolves with the reply message) or `error`
-   * (rejects with NetError). Rejects with TIMEOUT after `timeout` ms, OFFLINE when there is no
-   * session to send it on, BAD_MSG when it fails shared/protocol.js validation locally.
+   * Send a request and wait for its reply (any frame echoing the `rid`; `error`/`auth.error` reject).
+   * Rejects with TIMEOUT after `timeout` ms, OFFLINE when there is no session to send it on, BAD_MSG when it fails
+   * shared/protocol.js validation locally.
    * @param {string} t message type (C2S)
    * @param {object} [fields]
-   * @param {{timeout?: number}} [opts]
+   * @param {{timeout?: number, session?: boolean}} [opts] `session: false` marks an intent the server answers without
+   *   one (`auth.requestCode`, DESIGN §25): it may be sent as soon as the socket is open, before any `hello` — which
+   *   is exactly the title screen, where the player has no nickname to say hello with yet.
    * @returns {Promise<any>}
    */
   request(t, fields = {}, opts = {}) {
     return new Promise((resolve, reject) => {
       if (t === 'hello') { reject(new NetError('BAD_MSG', 'use setName() for hello')); return; }
+      const noSession = opts.session === false;
       const rid = this._nextRid();
       const msg = { ...(fields && typeof fields === 'object' ? fields : {}), t, rid };
       const bad = validateC2S(msg);
@@ -436,7 +523,8 @@ export class Net {
       }
       // Queue while a session is being (re)established; fail fast when none can come.
       const establishing = this.status === 'connecting' || this.status === 'handshaking' || this.status === 'reconnecting';
-      if (this.status !== 'online' && !(establishing && this.name && !this._manualClose)) {
+      const ready = this.status === 'online' || (noSession && this.status === 'connected');
+      if (!ready && !(establishing && ((noSession && !this._manualClose) || (this.name && !this._manualClose)))) {
         reject(new NetError(this._manualClose ? 'CLOSED' : 'OFFLINE'));
         return;
       }
@@ -452,7 +540,7 @@ export class Net {
         reject(new NetError('TIMEOUT'));
       }, timeout);
       this._pending.set(rid, entry);
-      if (this.status === 'online') entry.sent = this._sendRaw(msg);
+      if (ready) entry.sent = this._sendRaw(msg);
     });
   }
 
@@ -530,6 +618,8 @@ export class Net {
     const { t } = msg;
     const rid = msg.rid;
     const isHelloError = t === 'error' && rid != null && rid === this._helloRid;
+    // Any account answer proves this server speaks accounts (see `authSupported`).
+    if (t === 'auth.ok' || t === 'auth.error') this.authSupported = true;
 
     if (t === 'welcome') {
       this._onWelcome(msg);
@@ -548,7 +638,10 @@ export class Net {
       this._clearEntryTimer(entry);
       handled = true;
       try {
+        // `auth.error { code, message }` is `error` for the account intents (server/accounts.js): with the request's
+        // rid it answers auth.register / auth.login / auth.logout and rejects the pending request like any error.
         if (t === 'error') entry.reject(new NetError(msg.code, msg.msg, msg.detail));
+        else if (t === 'auth.error') entry.reject(new AuthError(msg.code, msg.message));
         else entry.resolve(msg);
       } catch (err) { console.error('[net] request callback failed', err); }
     }
@@ -660,8 +753,9 @@ const K_NAME = 'sp.name';
 const K_TOKEN = 'sp.token';      // sessionStorage: this tab's token
 const K_RECENT = 'sp.tokens';    // localStorage: this browser's recent tokens, most recent first
 const K_ENTERED = 'sp.entered';  // sessionStorage: this tab passed the title screen
+const K_ACCOUNT = 'sp.account';  // localStorage: the account token (server/accounts.js) — silent auto-login in every tab
 const RECENT_MAX = 4;
-const TOKEN_MAX_LEN = 64;        // protocol limit for hello.token
+const TOKEN_MAX_LEN = 64;        // protocol limit for hello.token / hello.auth
 const CHANNEL_NAME = 'sp.identity';
 /** How long init() waits for other tabs to claim a candidate token (ms). */
 export const CLAIM_QUERY_MS = 150;
@@ -825,6 +919,18 @@ export function createIdentity(deps = {}) {
     wasEntered: () => sget(session, K_ENTERED) === '1',
     /** @param {boolean} on */
     setEntered: (on) => (on ? sset(session, K_ENTERED, '1') : sdel(session, K_ENTERED)),
+    // The *account* token (server/accounts.js, DESIGN §25) lives in localStorage, not in sessionStorage: any tab or
+    // device that proves it becomes the same player, which is exactly the point — the session token above stays
+    // per-tab so two tabs of one browser remain two seats for a guest, while an account is one identity everywhere.
+    /** @returns {string|null} the account token to send as `hello.auth` (null ⇒ a guest session) */
+    loadAccountToken: () => {
+      const t = sget(local, K_ACCOUNT);
+      return isToken(t) ? t : null;
+    },
+    /** @param {string} token from `auth.ok` */
+    saveAccountToken: (token) => { if (isToken(token)) sset(local, K_ACCOUNT, token); },
+    /** Forget the account (auth.logout, or a token the server no longer knows). */
+    clearAccountToken: () => sdel(local, K_ACCOUNT),
   };
 }
 
@@ -832,4 +938,4 @@ export function createIdentity(deps = {}) {
 export const identity = createIdentity();
 
 /** Browser connection singleton (created lazily-safe: nothing touches the network until connect()). */
-export const net = new Net({ getToken: () => identity.getToken() });
+export const net = new Net({ getToken: () => identity.getToken(), getAuth: () => identity.loadAccountToken() });

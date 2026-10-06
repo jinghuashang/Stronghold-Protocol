@@ -443,11 +443,15 @@ function forwardedAddress(headers) {
  * Resolve an upgrade request's client address and its per-network limit key.
  * Forwarding headers are honoured from loopback/private peers ('auto'), always (true) or never (false).
  * Local/private peers without a forwarded address get `key: null` (never limited per network).
+ * A PROXY-protocol header (server/proxyprotocol.js) is the TCP layer's own statement about the connection: it
+ * outranks every forwarding header and needs no local-peer test — only the operator-enabled listener attaches it.
  * @param {import('node:http').IncomingMessage | undefined} req
  * @param {'auto' | boolean} [trustProxy]
  * @returns {{ ip: string, key: string | null }}
  */
 export function clientAddress(req, trustProxy = NET_DEFAULTS.trustProxy) {
+  const proxied = normalizeIp(req?.socket?.proxyProtocol?.sourceIp);
+  if (proxied) return { ip: proxied, key: isLocalIp(proxied) ? null : limitKeyOf(proxied) };
   const peer = normalizeIp(req?.socket?.remoteAddress);
   const local = !peer || isLocalIp(peer);
   if (trustProxy === true || (trustProxy !== false && local)) {
@@ -501,13 +505,16 @@ export class Network {
    *   log?: { info: Function, warn: Function, error: Function, debug?: Function },
    *   now?: () => number,
    *   options?: Partial<typeof NET_DEFAULTS>,
-   * }} opts
+   *   accounts?: object | null,
+   * }} opts `accounts` is the store of server/accounts.js (DESIGN §25): without it the auth intents answer
+   *   `accounts_disabled` and a `hello.auth` token is simply ignored (a guest session, exactly as before accounts).
    */
-  constructor({ registry, handler, log = noopLog, now = Date.now, options = {} }) {
+  constructor({ registry, handler, log = noopLog, now = Date.now, options = {}, accounts = null }) {
     this.registry = registry;
     this.handler = handler;
     this.log = log;
     this.now = now;
+    this.accounts = accounts;
     this.opts = { ...NET_DEFAULTS, ...options };
     /** @type {Map<import('ws').WebSocket, Connection>} */
     this.conns = new Map();
@@ -599,6 +606,15 @@ export class Network {
       return;
     }
     if (msg.t === 'hello') { this.onHelloMsg(conn, msg, now); return; }
+    // Accounts (server/accounts.js, DESIGN §25): answered before the session check, because `auth.requestCode`,
+    // `auth.register` and `auth.login` are valid without one (the server creates the session as part of binding the
+    // account — that is what lets the title screen register or sign in before it has a nickname). A mail-sending
+    // endpoint also draws from the heavy bucket: one socket cannot turn 40 requests a second into 40 e-mails.
+    if (msg.t.startsWith('auth.')) {
+      if (msg.t === 'auth.requestCode' && !conn.heavy.take(now)) { this.reply(conn, errorMsg(ERR.RATE, rid, `${msg.t} too often`)); return; }
+      void this.onAuthMsg(conn, msg).catch((e) => this.log.error('[net] auth handler crashed', e));
+      return;
+    }
     if (!conn.session) { this.reply(conn, errorMsg(ERR.BAD_MSG, rid, 'hello required')); return; }
     if (HEAVY_TYPES.has(msg.t) && !conn.heavy.take(now)) { this.reply(conn, errorMsg(ERR.RATE, rid, `${msg.t} too often`)); return; }
 
@@ -628,8 +644,16 @@ export class Network {
       this.reply(conn, errorMsg(ERR.BAD_MSG, rid, `version mismatch: server ${PROTOCOL_VERSION}`));
       return;
     }
-    const name = sanitizeName(msg.name);
-    if (!name) { this.reply(conn, errorMsg(ERR.BAD_MSG, rid, 'bad field name')); return; }
+    const helloName = sanitizeName(msg.name);
+    if (!helloName) { this.reply(conn, errorMsg(ERR.BAD_MSG, rid, 'bad field name')); return; }
+
+    // Accounts (server/accounts.js, DESIGN §25): `auth` is the account token. A verified one binds this session to the
+    // account's stable playerId, so the seat, room and match follow the account onto every device. An unknown token
+    // never costs the hello — the player just continues as a guest and the client forgets the credential (`auth.error`
+    // without a rid is exactly that message).
+    const auth = typeof msg.auth === 'string' ? msg.auth : null;
+    const account = auth && this.accounts ? this.accounts.verify(auth) : null;
+    if (auth && !account) this.reply(conn, { t: 'auth.error', code: 'bad_token', message: 'unknown or expired account token' });
 
     let session = conn.session;
     let resumed = false;
@@ -640,7 +664,7 @@ export class Network {
         resumed = true;
         if (session.ws && session.ws !== conn.ws) this.detachReplaced(session.ws);
       } else {
-        session = this.registry.create(name);
+        session = this.registry.create(account ? account.name : helloName);
         if (!session) { this.reply(conn, errorMsg(ERR.INTERNAL, rid, 'server full')); return; }
       }
       conn.session = session;
@@ -648,7 +672,20 @@ export class Network {
       session.connected = true;
       session.disconnectedAt = null;
     }
-    session.name = name;
+    // A repeated hello on a live socket only renames/resyncs (`repeat`): the session it already holds is the identity
+    // the account was bound to, so nothing to claim.
+    let bound = true;
+    if (account && !repeat) {
+      const claimed = this.bindAccount(conn, session, account, auth);
+      if (!claimed) {
+        bound = false;
+        this.reply(conn, { t: 'auth.error', code: 'in_room', message: 'leave the room before signing in' });
+      } else if (claimed !== session) {
+        session = claimed; // the account's own session was adopted from the other device: resend everything
+        resumed = true;
+      }
+    }
+    session.name = bound && account ? account.name : helloName;
     session.lastSeen = now;
     session.addr = conn.ip;
     session.limitKey = conn.key;
@@ -660,6 +697,109 @@ export class Network {
       this.handler.onHello?.(session, { resumed, repeat });
     } catch (e) {
       this.log.error('[net] onHello crashed', e);
+    }
+  }
+
+  /**
+   * Bind a session to an account (server/accounts.js, DESIGN §25): the account's `playerId` is what a seat follows, so
+   * the session takes it — and when the account already has a session on another socket, that session is *adopted*
+   * (its socket is closed with 4001, this one takes it over) which is the multi-device hand-over.
+   *
+   * A bind that would move a *seated* session (`session.roomCode`, lobby-owned) to another playerId is refused: the
+   * seat is keyed by playerId and a half-moved seat would leave a ghost behind. Signing in as the same account changes
+   * nothing and is always allowed.
+   *
+   * @param {Connection} conn @param {Session} session @param {{ playerId: string, name: string }} account
+   * @param {string | null} token the account token that proved it
+   * @returns {Session | null} the session to keep (possibly the adopted one), or null when the claim is refused
+   */
+  bindAccount(conn, session, account, token) {
+    if (session.playerId === account.playerId) {
+      session.name = account.name;
+      session.accountToken = token;
+      return session;
+    }
+    if (session.roomCode) return null;
+    const owned = this.registry.byId(account.playerId);
+    if (owned) {
+      if (owned.ws && owned.ws !== conn.ws) this.detachReplaced(owned.ws);
+      this.registry.remove(session); // the guest session this connection held goes (it seats nobody)
+      conn.session = owned;
+      owned.ws = conn.ws;
+      owned.connected = true;
+      owned.disconnectedAt = null;
+      owned.name = account.name;
+      owned.accountToken = token;
+      return owned;
+    }
+    this.registry.byPlayerId.delete(session.playerId);
+    session.playerId = account.playerId;
+    this.registry.byPlayerId.set(session.playerId, session);
+    session.name = account.name;
+    session.accountToken = token;
+    return session;
+  }
+
+  /**
+   * `auth.*` (server/accounts.js, DESIGN §25): the verification-code request, registration, login and logout. Answers
+   * `auth.codeSent` / `auth.ok` / `auth.error` instead of `ok`/`error` — the request's `rid` is echoed, so a client
+   * request resolves or rejects on the answer. With no store (ACCOUNTS=off / no SMTP) every intent answers
+   * `accounts_disabled`, which is what hides the account panel in the browser.
+   * @param {Connection} conn @param {any} msg already validated by shared/protocol.js
+   */
+  async onAuthMsg(conn, msg) {
+    const rid = msg.rid;
+    const out = (m) => this.reply(conn, validRid(rid) ? { ...m, rid } : m);
+    const accounts = this.accounts;
+    if (!accounts) { out({ t: 'auth.error', code: 'accounts_disabled', message: 'accounts are disabled on this server' }); return; }
+
+    if (msg.t === 'auth.logout') {
+      const session = conn.session;
+      if (!session) { out({ t: 'auth.error', code: 'no_session', message: 'hello required' }); return; }
+      const revoked = session.accountToken ? accounts.logout(session.accountToken) : false;
+      session.accountToken = null;
+      if (revoked) out({ t: 'ok' });
+      else out({ t: 'auth.error', code: 'bad_token', message: 'no account token on this session' });
+      return;
+    }
+
+    if (msg.t === 'auth.requestCode') {
+      const res = await accounts.requestCode(msg.email, { ip: conn.ip });
+      if (!res.ok) { out({ t: 'auth.error', code: res.error, message: res.error }); return; }
+      out({ t: 'auth.codeSent', email: String(msg.email).trim().toLowerCase(), ttlSec: res.ttlSec });
+      return;
+    }
+
+    // register/login. A registration always claims a *new* playerId, so a session that holds a seat could never take it
+    // — refuse before the account is created (a login as the very same account is fine, hence the check after it).
+    let session = conn.session;
+    if (msg.t === 'auth.register' && session && session.roomCode) { out({ t: 'auth.error', code: 'in_room', message: 'leave the room before signing in' }); return; }
+    const res = msg.t === 'auth.register'
+      ? await accounts.register({ email: msg.email, code: msg.code, name: msg.name, password: msg.password })
+      : await accounts.login({ email: msg.email, password: msg.password });
+    if (!res.ok) { out({ t: 'auth.error', code: res.error, message: res.error }); return; }
+    if (!session) {
+      session = this.registry.create(res.name);
+      if (!session) { this.reply(conn, errorMsg(ERR.INTERNAL, rid, 'server full')); return; }
+      conn.session = session;
+      session.ws = conn.ws;
+      session.connected = true;
+      session.disconnectedAt = null;
+    }
+    const was = session.playerId;
+    const bound = this.bindAccount(conn, session, res, res.token);
+    if (!bound) { out({ t: 'auth.error', code: 'in_room', message: 'leave the room before signing in' }); return; }
+    // `auth.ok` goes first (the browser stores the account token and marks the account), then — when the session
+    // changed identity or object — the `welcome` that tells it which session it now holds, and the lobby's resync,
+    // which *is* the hand-over: same room, same seat, running match included.
+    out({ t: 'auth.ok', playerId: res.playerId, name: res.name, token: res.token });
+    if (bound !== session || bound.playerId !== was) {
+      this.reply(conn, { t: 'welcome', playerId: bound.playerId, token: bound.token, name: bound.name, serverNow: this.now(), version: PROTOCOL_VERSION, resumed: true });
+      try {
+        this.handler.onHello?.(bound, { resumed: true, repeat: false });
+      } catch (e) {
+        this.log.error('[net] onHello crashed', e);
+      }
     }
   }
 

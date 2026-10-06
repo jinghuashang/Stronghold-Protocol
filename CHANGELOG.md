@@ -1,5 +1,20 @@
 # 更新记录
 
+## 未发布
+
+新功能：账号（邮箱验证码注册 / 登录）、多端接力，以及给负载均衡器准备的真实客户端 IP 支持。
+
+### 账号与多端接力
+
+- 新增**注册 / 登录**：用邮箱注册——服务器发一封 6 位验证码邮件（10 分钟有效、一次性），再设置昵称与密码；登录用邮箱 + 密码。密码以 scrypt 加盐哈希保存，登录 token 只存 sha256，文件里没有明文（`data/accounts.json`，请纳入备份）。
+- **同一账号多端接力**：在电脑上玩到一半，用手机登录同一账号会立刻接管**同一座位**（同一房间、同一局，服务器把完整状态重发到新连接），原设备收到 4001「该身份已在其他页面登录」；手机刷新后自动登录，不必再输昵称。
+- 注册需要 SMTP，且**默认关闭**：`ACCOUNTS=off`（默认，只有游客模式）／`on`（旧名 `required`，开启，**未配好 SMTP 时服务器拒绝启动**）／`auto`（配齐 SMTP 才开启）。开启时启动会做一次 SMTP 连接 + 认证自检并把结果写进日志。详见 [docs/DEPLOY.md](docs/DEPLOY.md) §7。
+- 发送验证码有节流：同一邮箱 60 秒才能再要一条、每小时最多 5 条，同一 IP 每小时最多 20 条；连续输错 5 次作废。账号功能关闭时标题页只显示「游客开始」，行为与旧版本一致。
+
+### 真实客户端 IP（PROXY protocol）
+
+- 支持 **PROXY protocol v1 / v2**（`PROXY_PROTOCOL=off` 默认 / `on` / `required`）：HAProxy 的 `send-proxy-v2`、frp 的 `transport.proxyProtocolVersion`、nginx 的 `stream { proxy_protocol on; }`、Caddy 的 `transport http { proxy_protocol v2 }` 都能用。它在 TCP 层到达、客户端伪造不了，优先于 `CF-Connecting-IP` / `X-Real-IP` / `X-Forwarded-For`，按网络统计的连接 / 房间 / 对局上限因此按真实客户端计算；`required` 时没有该头的直连会被直接关闭。详见 [docs/DEPLOY.md](docs/DEPLOY.md) §2.5。
+
 ## 0.1.4 — 2026-10-06
 
 0.1.3 之后的小版本：合并了多位贡献者的 PR，修正了高台和阿戈尔的规则，并修正了文档和测试。下一个版本（0.2.0）会做一次便于维护的重构、多语言支持，以及补位和自选编队。

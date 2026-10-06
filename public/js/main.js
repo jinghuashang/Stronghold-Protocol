@@ -16,6 +16,13 @@
 // A `welcome` with a NEW playerId (the server restarted / the session expired) while a room or match was on screen:
 // toast 「服务器会话已重置，上一局模拟已结束」 (store.js sessionResetNotice) and return to the lobby with nothing stale.
 //
+// Accounts (server/accounts.js, DESIGN §25): the title's 登录 / 注册 panel sends `auth.login` / `auth.register`; the
+// `auth.ok` handler here keeps the account token in localStorage and the account name in the store, and net.js sends it
+// as `hello.auth` from then on. Because the server binds the session to the account's stable playerId, signing in on
+// another device takes the seat over: this tab is closed with 4001 (「该身份已在其他页面登录」) and the other one gets
+// `welcome { resumed }` plus a full room/match resync. An `auth.error` without a rid means the stored token is unknown
+// — the account is forgotten and the player continues as a guest.
+//
 // Shared modules are imported relatively ('../../shared/…' resolves to /shared/… in the browser).
 // Multi-device support (ui/device.js + css/devices.css): feature classes on <html>, no page zoom, safe areas, rotation
 // re-layout; ui/compat.js polyfills are imported before anything else.
@@ -141,7 +148,10 @@ function onWelcome(msg) {
   store.set({ me: { playerId: msg.playerId ?? null, name, token: typeof msg.token === 'string' ? msg.token : null } });
   welcomeAt = Date.now();
 
-  if (prevId != null && prevId !== msg.playerId) {
+  // An account bind hands this client the account's playerId (auth.ok before this welcome, §25): that is *not* a
+  // brand-new server session — the seat, room and match belong to the account and the lobby is resending them.
+  const accountId = store.get().account?.playerId ?? prev.account?.playerId ?? null;
+  if (prevId != null && prevId !== msg.playerId && msg.playerId !== accountId) {
     // A brand-new server session (the server restarted — crashed / killed, so no room.closed arrived — or this session
     // expired on it): whatever we showed before is gone — back to the lobby cleanly and say why.
     const notice = sessionResetNotice(prev, msg.playerId);
@@ -161,6 +171,65 @@ function onWelcome(msg) {
     }, RESTORE_GRACE_MS);
   }
   schedulePendingJoin();
+}
+
+/**
+ * An account login (or registration) succeeded (`auth.ok`, server/accounts.js; DESIGN §25): keep the account token
+ * (every later `hello` carries it, so this browser and any other device that proves the same account become the same
+ * player) and show the account name. The session itself is already bound to the account's stable playerId
+ * server-side, and a room or match held by another device is on its way — the lobby resent it with this `welcome`
+ * (that is the hand-over).
+ * @param {any} msg `auth.ok { playerId, name, token }`
+ */
+function onAuthOk(msg) {
+  if (typeof msg.token === 'string') identity.saveAccountToken(msg.token);
+  const name = sanitizeName(msg.name);
+  store.set((s) => ({
+    account: { name: name || s.account?.name || '', playerId: msg.playerId ?? null },
+    me: name ? { ...s.me, name } : s.me,
+  }));
+  if (!name) return;
+  identity.saveName(name);
+  // The server renamed the session with the account name (or already had it): a rename only costs one more hello.
+  if (net.name !== name) net.setName(name);
+}
+
+/**
+ * The server refused an account intent (`auth.error { code, message }`). An explicit 登录/注册 answers the request that
+ * asked (the title panel shows it), so anything without a `rid` is the *silent* path: the token this `hello` carried
+ * is not known here any more (a restarted server without the file, or a token rotated out) — forget it and stay a
+ * guest. No dialog, no error toast on the title screen; a player already inside gets one line of explanation.
+ * `accounts_disabled` means the server has no account feature at all (ACCOUNTS=off / no SMTP): the panel hides itself.
+ * @param {any} msg `auth.error { code, message, rid? }`
+ */
+function onAuthError(msg) {
+  if (msg.code === 'accounts_disabled') {
+    store.patch('ui', { accountsOff: true });
+    if (msg.rid != null) return; // the panel that asked shows the reason
+    store.set({ account: null });
+    return;
+  }
+  if (msg.rid != null) return;
+  identity.clearAccountToken();
+  store.set({ account: null });
+  if (store.get().session.entered) toast('账号登录已失效，已切换为游客身份', 'warn', { ttl: 6000 });
+}
+
+/**
+ * Ask the server whether it has the account feature (`/healthz`), so the title does not offer a flow that cannot work.
+ * A field is optional: an older server answers without one and the panel simply stays visible (an `auth.error` with
+ * `accounts_disabled` hides it later). INDEX.JS: expose `accounts: 'on' | 'off'` in the /healthz JSON.
+ */
+function probeAccounts() {
+  if (typeof fetch !== 'function') return;
+  fetch('/healthz', { cache: 'no-store' })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((h) => {
+      const state = h && typeof h === 'object' ? h.accounts : null;
+      const off = state === 'off' || state === false || (state && typeof state === 'object' && state.enabled === false);
+      if (off) store.patch('ui', { accountsOff: true });
+    })
+    .catch(() => { /* no healthz (an old server): the panel stays and degrades on its own */ });
 }
 
 function onRoomState(msg) {
@@ -200,9 +269,17 @@ function wireNet() {
   });
   net.on('clock', (c) => store.set({ clock: { offset: c.offset, rtt: c.rtt, synced: c.synced } }));
   net.on('welcome', onWelcome);
+  net.on('auth.ok', onAuthOk);
+  net.on('auth.error', onAuthError);
   net.on('helloError', (err) => toastError(err));
+  // A server older than accounts refused the hello's `auth` field once: net.js retried it as a guest (see
+  // _onHelloError). Stop showing 已登录 — the token is kept, so a server that learns accounts again signs us straight
+  // back in; until then this browser plays as a guest, which is the one thing that must never break.
+  net.on('authUnsupported', () => store.set({ account: null }));
   net.on('replaced', () => toast('该身份已在其他页面登录，本页已断开', 'warn', { ttl: 6000 }));
   net.on('unhandledError', (err) => toastError(err));
+  // Whether this server has accounts at all (an optional /healthz field): hides the title's account panel when not.
+  probeAccounts();
   net.on('room.state', onRoomState);
   net.on('room.closed', (msg) => {
     backToLobby();
@@ -321,8 +398,13 @@ async function boot() {
   const pendingJoin = parseRoomParam(location.search);
   const savedName = sanitizeName(identity.loadName());
   const entered = identity.wasEntered() && !!savedName;
+  // A stored account token (localStorage) means this browser signed in at some point: the title shows 已登录 until the
+  // first `hello` says otherwise — the token travels with it as `auth`, and a server that does not know it answers
+  // `auth.error`, which onAuthError turns back into a guest (never a blocking error).
+  const signedIn = !!identity.loadAccountToken() && !!savedName;
   store.set((s) => ({
     me: { ...s.me, name: savedName },
+    account: signedIn ? { name: savedName, playerId: null } : null,
     session: { entered },
     ui: { ...s.ui, pendingJoin },
   }));

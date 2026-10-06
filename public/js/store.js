@@ -3,6 +3,8 @@
 // One app-wide store holds everything the UI renders from:
 //   connection  – socket status + latency (fed by net.js via main.js)
 //   me          – { playerId, name, token } from `welcome`
+//   account     – { name, playerId } of the signed-in account (server/accounts.js, DESIGN §25) or null (a guest); the
+//                 account *token* stays in localStorage (net.js identity) and is never rendered
 //   session     – { entered } (the player pressed 开始 on the title screen in this tab)
 //   room        – last `room.state` payload (without `t`) or null
 //   match       – { public, private, field, result } from the `m.*` pushes; `battle` = the local battle runner's
@@ -76,13 +78,20 @@ export const emptyMatch = () => ({ public: null, private: null, field: null, res
 export const initialState = Object.freeze({
   connection: { status: 'idle', ping: null, attempt: 0, retryAt: 0, lastError: null, everOnline: false },
   me: { playerId: null, name: '', token: null },
+  // The signed-in account (server/accounts.js, DESIGN §25): { name, playerId }, or null for a guest. Its *token* is
+  // never in here — it lives in localStorage behind net.js `identity.loadAccountToken()`, because it is a credential
+  // and this store is rendered. The account name is what the title screen shows; the session's own token stays in
+  // `me.token` (welcome).
+  account: null,
   session: { entered: false },
   room: null,
   match: emptyMatch(),
   ticker: [],
   emotes: [],
   clock: { offset: 0, rtt: null, synced: false },
-  ui: { pendingJoin: null, restoring: false, buildStale: false },
+  // `ui.accountsOff`: this server has no account feature (ACCOUNTS=off, or an incomplete SMTP configuration — the
+  // account panel hides itself and the player continues as a guest).
+  ui: { pendingJoin: null, restoring: false, buildStale: false, accountsOff: false },
 });
 
 /** The app-wide store singleton. */

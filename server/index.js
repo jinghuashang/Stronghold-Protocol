@@ -19,8 +19,13 @@
 //   * GET /healthz → JSON status (protocol `version`, release `app`, rooms, matches, sessions, sockets).
 //   * WebSocket (ws) at /ws, maxPayload 64 KB → server/net.js Network → server/lobby.js Lobby.
 //   * Env: PORT (default 3000), HOST (default 0.0.0.0), TRUST_PROXY ('auto' default: honour CF-Connecting-IP /
-//     X-Real-IP / X-Forwarded-For only from loopback/private peers such as a local cloudflared; '1' always; '0' never).
-//     Prints LAN URLs on boot.
+//     X-Real-IP / X-Forwarded-For only from loopback/private peers such as a local cloudflared; '1' always; '0' never);
+//     PROXY_PROTOCOL ('off' default; 'on' accepts a HAProxy PROXY-protocol v1/v2 header and prefers its source address
+//     over every forwarding header; 'required' also closes connections that carry none — see server/proxyprotocol.js).
+//     ACCOUNTS ('off' DEFAULT: no registration/sign-in | 'auto': on when the SMTP settings are complete |
+//     'on' (alias 'required'): accounts are asked for, an incomplete SMTP configuration refuses to start) +
+//     SMTP_HOST/SMTP_PORT/SMTP_SECURE/SMTP_USER/
+//     SMTP_PASS/SMTP_FROM select the accounts feature (server/accounts.js, DESIGN §25); Prints LAN URLs on boot.
 //   * Per-network limits for internet clients (see net.js clientAddress; local/LAN peers are exempt): open sockets
 //     (maxConnectionsPerAddr, refused at upgrade with 429), rooms and running matches (lobby.js).
 //   * Graceful shutdown on SIGINT/SIGTERM (rooms get room.closed{reason:'shutdown'}, sockets close 1001).
@@ -44,6 +49,9 @@ import { Lobby } from './lobby.js';
 import { getData, loadData } from './data.js';
 import { PROTOCOL_VERSION, APP_VERSION } from '../shared/constants.js';
 import { MEDIA_PREFIX, AUDIO_EXTS } from '../shared/media.js';
+import { parseProxyProtocol, createProxyProtocolListener } from './proxyprotocol.js';
+import { accountsConfigState, createAccounts } from './accounts.js';
+import { createSmtp } from './smtp.js';
 
 /** Repository root. */
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -607,8 +615,11 @@ function makeLogger(quiet) {
  *   ratePerSec?: number, rateBurst?: number, maxConnections?: number, maxRooms?: number,
  *   maxConnectionsPerAddr?: number, maxRoomsPerAddr?: number, maxMatchesPerAddr?: number, resyncMinGapMs?: number,
  *   heavyPerSec?: number, heavyBurst?: number, trustProxy?: 'auto' | boolean, soloReconnectWindowMs?: number,
+ *   proxyProtocol?: 'off' | 'on' | 'required', accounts?: object | null, accountsState?: object,
+ *   accountsFile?: string, env?: Record<string, string | undefined>, exitOnConfigError?: boolean,
  * }} [opts]
- * @returns {Promise<{ port: number, host: string, url: string, server: http.Server, wss: WebSocketServer,
+ * @returns {Promise<{ port: number, host: string, url: string, server: http.Server, listener: import('node:net').Server,
+ *                     proxyProtocol: 'off' | 'on' | 'required', wss: WebSocketServer,
  *                     lobby: Lobby, network: Network, registry: SessionRegistry, close: () => Promise<void> }>}
  */
 export async function startServer(opts = {}) {
@@ -634,7 +645,36 @@ export async function startServer(opts = {}) {
     if (opts[k] != null) lobbyOptions[k] = opts[k];
   }
   const lobby = new Lobby({ registry, log, MatchClass: opts.MatchClass, getData: () => data, seedFn: opts.seedFn, options: lobbyOptions });
-  const network = new Network({ registry, handler: lobby, log, options: netOptions });
+
+  // Accounts (server/accounts.js + smtp.js, DESIGN §25). The feature mails verification codes, so whether it can run at
+  // all is decided here, before anything listens: `ACCOUNTS=required` with an incomplete SMTP configuration refuses to
+  // start, `auto` (the default) just turns the feature off (with a warning when the configuration is *half* there).
+  const accountsState = opts.accountsState || accountsConfigState(opts.env || process.env);
+  let accounts = opts.accounts || null;
+  if (accountsState.error) {
+    if (accountsState.mode === 'on' && opts.exitOnConfigError !== false) {
+      log.error(`[accounts] ${accountsState.error}`);
+      process.exit(1); // accounts were asked for and cannot run: never start a server players cannot register on
+    }
+    log.warn(`[accounts] ${accountsState.error}`);
+  }
+  let smtp = null;
+  if (accountsState.enabled) {
+    smtp = createSmtp(accountsState.smtp);
+    if (!accounts) accounts = createAccounts({ file: opts.accountsFile, smtp, log });
+    // The relay is checked in the background: it must not delay the listen, and a relay that is down only costs
+    // registrations (every auth intent then answers `smtp_failed`), never the game.
+    smtp.verify()
+      .then((res) => (res.ok
+        ? log.info(`[accounts] SMTP ready (${smtp.config.host}:${smtp.config.port}${smtp.config.secure ? ', implicit TLS' : ', STARTTLS'})`)
+        : log.error(`[accounts] SMTP check failed: ${res.error}`)))
+      .catch(() => {});
+    log.info('[accounts] registration & sign-in are ON 注册与登录已开启（验证码邮件经 SMTP 发送）');
+  } else if (!accountsState.error) {
+    log.info('[accounts] OFF 账号系统未启用/默认关闭（要启用：ACCOUNTS=on 且配好 SMTP_*，或 ACCOUNTS=auto）');
+  }
+
+  const network = new Network({ registry, handler: lobby, log, options: netOptions, accounts });
   const serveStatic = createStaticHandler({ publicDir, dataDir, sharedDir, log });
   const startedAt = Date.now();
   // The tag is per process (see buildTag): read the browser runtime once, here, not on every /healthz.
@@ -667,6 +707,9 @@ export async function startServer(opts = {}) {
         // older than this reloads itself, so a deploy reaches clients that never reload
         build: buildTag(),
         sockets: network.connectionCount, sessions: registry.size, ...lobby.stats(),
+        // whether registration/sign-in are available here (ACCOUNTS + SMTP, §25): the title's account panel hides
+        // itself when this says 'off' (public/js/main.js probeAccounts)
+        accounts: accounts ? 'on' : 'off',
       });
       return;
     }
@@ -680,6 +723,12 @@ export async function startServer(opts = {}) {
       else socket.destroy();
     } catch { /* ignore */ }
   });
+
+  // PROXY protocol (server/proxyprotocol.js): with PROXY_PROTOCOL=on|required the process listens on a net.Server
+  // that peeks HAProxy's v1/v2 header first and then feeds the socket to the http server (HTTP + /ws both), so
+  // net.js clientAddress can use the real client address the balancer sent instead of a forwarding header.
+  const proxyMode = opts.proxyProtocol ?? parseProxyProtocol(process.env.PROXY_PROTOCOL);
+  const listener = proxyMode === 'off' ? server : createProxyProtocolListener(server, { mode: proxyMode, log });
 
   const wss = new WebSocketServer({ noServer: true, maxPayload: WS_MAX_PAYLOAD, perMessageDeflate: false, clientTracking: false });
   wss.on('connection', (ws, req) => network.handleConnection(ws, req));
@@ -705,11 +754,11 @@ export async function startServer(opts = {}) {
 
   try {
     await new Promise((resolve, reject) => {
-      const onError = (e) => { server.off('listening', onListening); reject(e); };
-      const onListening = () => { server.off('error', onError); resolve(); };
-      server.once('error', onError);
-      server.once('listening', onListening);
-      server.listen(port, host);
+      const onError = (e) => { listener.off('listening', onListening); reject(e); };
+      const onListening = () => { listener.off('error', onError); resolve(); };
+      listener.once('error', onError);
+      listener.once('listening', onListening);
+      listener.listen(port, host);
     });
   } catch (e) {
     network.close(); // stop heartbeat/sweep timers of the half-built server
@@ -717,7 +766,7 @@ export async function startServer(opts = {}) {
   }
   server.on('error', (e) => log.error('[http] server error', e));
 
-  const addr = server.address();
+  const addr = listener.address();
   const actualPort = typeof addr === 'object' && addr ? addr.port : port;
   const url = `http://${host === '0.0.0.0' || host === '::' ? 'localhost' : host}:${actualPort}`;
 
@@ -728,7 +777,10 @@ export async function startServer(opts = {}) {
       try { lobby.shutdown('shutdown'); } catch (e) { log.error('[shutdown] lobby', e); }
       network.close();
       await new Promise((resolve) => {
-        server.close(() => resolve());
+        // the http server is not the listener when the PROXY protocol is on: stop the net.Server first, then let the
+        // http server drop its connections (it never listened, so its own close() would throw ERR_SERVER_NOT_RUNNING)
+        if (listener !== server) { try { listener.close(() => {}); } catch { /* ignore */ } }
+        try { server.close(() => resolve()); } catch { resolve(); }
         server.closeIdleConnections?.();
         setTimeout(() => { server.closeAllConnections?.(); }, 500).unref();
       });
@@ -737,7 +789,7 @@ export async function startServer(opts = {}) {
     return closing;
   }
 
-  return { port: actualPort, host, url, server, wss, lobby, network, registry, close };
+  return { port: actualPort, host, url, server, listener, proxyProtocol: proxyMode, wss, lobby, network, registry, accounts, accountsState, close };
 }
 
 // ---------------------------------------------------------------------------------------------------

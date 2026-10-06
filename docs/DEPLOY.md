@@ -198,6 +198,60 @@ server {
 
 https / wss 说明：页面通过 https 打开时客户端自动连接 `wss://同一域名/ws`；http 时用 `ws://`。服务器本身只提供 http，证书由代理 / 隧道负责。代理与服务器在同一台机器或内网时，`TRUST_PROXY=auto` 会信任它的 `X-Forwarded-For` / `X-Real-IP`；代理在公网另一台机器上时设 `TRUST_PROXY=1`（同时确保游戏端口只对代理开放）。
 
+### 2.5 PROXY protocol（负载均衡器在 TCP 层告知真实 IP，可选）
+
+公网负载均衡器 / 隧道（HAProxy、frp、nginx 的 `stream` 模块、Cloudflare Spectrum…）可以在 TCP 连接最前面附加一段 [`PROXY` 头](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt)，在 HTTP 之前就把**真实客户端地址**告诉服务器。它和 `X-Forwarded-For` 的区别：这段头是 TCP 层数据，只有均衡器能加、客户端伪造不了，因此按网络统计的连接 / 房间 / 对局上限会按真实客户端计算（而不是把整个机房算成一个人）。
+
+```bash
+PROXY_PROTOCOL=on       npm start   # 有 PROXY 头就用它的地址；没有头（直连）照常服务
+PROXY_PROTOCOL=required npm start   # 必须有 PROXY 头：直连会被直接关闭（端口只开放给均衡器时推荐）
+```
+
+- 支持 v1（`PROXY TCP4/TCP6/UNKNOWN`）与 v2（二进制签名）；`UNKNOWN` / v2 的 `LOCAL`（负载均衡器自己的健康检查）不提供地址，仍按对端地址计。
+- 与 `TRUST_PROXY` 不冲突：PROXY 头的地址**优先于** `CF-Connecting-IP` / `X-Real-IP` / `X-Forwarded-For`。
+- 用 `required` 时把游戏端口只对本机 / 均衡器开放（例如 `HOST=127.0.0.1` 或防火墙），否则绕过均衡器直连的客户端会被断开。
+
+均衡器示例：
+
+```haproxy
+# HAProxy：把真实地址用 v2 头发给游戏服务器
+server game 127.0.0.1:3000 send-proxy-v2
+```
+
+```ini
+# frp（frpc.ini）：为转发到本机 3000 的隧道开启 PROXY protocol v2
+[game]
+type = tcp
+local_ip = 127.0.0.1
+local_port = 3000
+transport.proxyProtocolVersion = v2
+```
+
+```nginx
+# nginx：注意 PROXY protocol 只在 stream 模块（TCP 转发）里支持，http 模块没有
+stream {
+  server {
+    listen 443 ssl;
+    # ssl_certificate / ssl_certificate_key …
+    proxy_pass 127.0.0.1:3000;
+    proxy_protocol on;
+  }
+}
+```
+
+```caddyfile
+# Caddy v2.7+：reverse_proxy 的 http transport 可发 PROXY protocol
+game.example.com {
+  reverse_proxy 127.0.0.1:3000 {
+    transport http {
+      proxy_protocol v2
+    }
+  }
+}
+```
+
+排错：开了 `PROXY_PROTOCOL` 但均衡器没发头时，浏览器会一直转圈（连接被 `required` 关闭）或按直连地址计（`on`）；用 `curl -v http://127.0.0.1:3000/healthz` 直连能通、经均衡器不通，通常是均衡器那一侧没开 `send-proxy*` / `proxy_protocol on`。
+
 ## 3. Docker
 
 ```bash
@@ -283,3 +337,50 @@ services:
 **没有客户端的服务器**想要上表中的官方素材：从**同一版本**的完整包（[Releases](https://github.com/sganggs/Stronghold-Protocol/releases)）里，把 `public/assets/local/` 文件夹和 `data/local-assets.json` 复制到服务器项目目录下的相同位置。服务器每次请求都会重新读取这两处，不必重启，玩家刷新页面即可。一定要用与服务器代码相同版本的完整包：各版本提取的内容和清单可能不同（例如灼热 / 炽焰源石虫的模型是 0.1.0 之后才加入的），混用其他版本的文件会缺图或用错图。复制后 `node tools/doctor.mjs` 会显示本地素材的条目数和「3D 棋盘可用」。
 
 **3D 棋盘贴图的下载量**：每位玩家进入对局时都要从开服的电脑下载 3D 棋盘的 12 张贴图。提取时会给这 12 张各写一份 WebP（颜色贴图有损、质量 95，法线和数据贴图无损），清单里列的是 WebP，同名 PNG 留在旁边给裁切工具和 setup 用。这部分下载量从约 6.7 MB 降到约 2 MB，网速慢的远程联机最明显。只有 PNG 的本地素材（例如在这一改动之前提取的）可以用提取时的 Python 环境运行 `tools/local-extract/extract.py --webp` 就地补上，只需要 Pillow，不需要客户端。
+
+## 7. 账号、邮箱验证码与 SMTP
+
+默认是「输入昵称即玩」的游客模式。开启**注册 / 登录**后：玩家用**邮箱**注册（服务器发一封 6 位验证码邮件 → 输入验证码 + 昵称 + 密码），之后在任何设备用「邮箱 + 密码」登录；同一账号在电脑玩到一半，手机登录后会立刻接管同一座位，继续同一局。
+
+### 7.1 配置（环境变量）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `ACCOUNTS` | `off` | **默认关闭**（只有游客模式）。`on`（旧名 `required`）：开启注册/登录，**启动前必须配好 SMTP，否则服务器拒绝启动**（退出码 1）；`auto`：SMTP 配齐才开启，没配就关闭（启动日志会说明）；`off`：完全关闭 |
+| `SMTP_HOST` | 空 | SMTP 服务器，如 `smtp.qq.com`、`smtp.gmail.com`、企业邮箱地址 |
+| `SMTP_PORT` | `465`（`SMTP_SECURE=0` 时 `587`） | 端口 |
+| `SMTP_SECURE` | `1` | `1` = 直连 TLS（465）；`0` = 明文连接后 STARTTLS（587） |
+| `SMTP_USER` | 空 | 登录名（通常就是完整邮箱） |
+| `SMTP_PASS` | 空 | 密码或**授权码**（QQ / 163 等要在邮箱后台生成授权码，别填登录密码） |
+| `SMTP_FROM` | = `SMTP_USER` | 发件人地址（多数服务要求与登录名一致） |
+| `SMTP_REJECT_UNAUTHORIZED` | `1` | `0` = 不校验 SMTP 服务器证书（仅自建/内网自签证书时用） |
+
+PowerShell 示例（Windows 小主机；也可以写进 `scripts\service.env.cmd`）：
+
+```powershell
+$env:ACCOUNTS="on"
+$env:SMTP_HOST="smtp.qq.com"; $env:SMTP_PORT="465"; $env:SMTP_SECURE="1"
+$env:SMTP_USER="you@qq.com"; $env:SMTP_PASS="邮箱后台生成的授权码"; $env:SMTP_FROM="you@qq.com"
+npm start
+```
+
+- 不设 `ACCOUNTS`（或 `ACCOUNTS=off`）→ 账号功能关闭，标题页只显示「游客开始」，和旧版本完全一致。
+- `ACCOUNTS=on`（或 `required`）+ SMTP 没配齐 / 只配了一部分 → **拒绝启动**（退出码 1，日志里列出缺的变量）——这就是「启动前必须配好 SMTP」。
+- `ACCOUNTS=auto` + SMTP 没配齐 / 只配了一部分 → 关闭账号并在启动日志里说明，服务器照常启动。
+- 账号启用时启动会做一次 SMTP 连接 + 认证自检（`verify()`），结果写进日志；自检失败只影响注册收信，房间与对局照常。
+
+### 7.2 行为与限额
+
+- 验证码：6 位数字、10 分钟有效、一次性；同一邮箱 60 秒才能再要一条、每小时最多 5 条；同一 IP 每小时最多 20 条；连续输错 5 次作废。
+- 账号数据存 `data/accounts.json`：密码用 scrypt 加盐哈希，登录 token 只存 `sha256`；文件里没有明文密码或 token。**请把这个文件纳入备份**（服务器其余部分仍然无状态）。
+- 关闭账号时 `auth.*` 消息一律回「账号功能未启用」，客户端只保留游客入口。
+- 服务器的正常游戏（房间、对局、素材）不受 SMTP 影响。
+
+### 7.3 排错
+
+| 现象 | 处理 |
+|---|---|
+| 启动即退出，日志说 SMTP 配置不完整 | 检查 `SMTP_*` 是否只填了一部分；改用 `ACCOUNTS=auto` 会在这种情况下自动关闭账号并继续启动 |
+| 注册时说「验证码发送失败」 | 看服务器日志里的 SMTP 错误：常见是授权码错误、465/587 被网络屏蔽、`SMTP_FROM` 与登录名不一致被拒 |
+| 收不到邮件 | 先看垃圾邮件；QQ / 163 / Gmail 都必须用授权码或应用专用密码，不能用账号密码 |
+| 想临时关掉账号 | `ACCOUNTS=off`（或清空 `SMTP_*` 后用 `ACCOUNTS=auto`） |

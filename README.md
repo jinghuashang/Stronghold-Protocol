@@ -111,6 +111,9 @@ npm start          # 启动服务器：http://localhost:3000
 | `SP_COMBAT` | `client` | `client`：各玩家浏览器模拟自己的战斗（服务器负载极低）；`server`：由服务器模拟并推流 |
 | `SP_VERIFY` | `off` | 服务器复算客户端上报的战斗结果：`off` / `sample`（约 1/8 抽查）/ `all`（全部复算，更耗 CPU） |
 | `TRUST_PROXY` | `auto` | 是否信任 `X-Forwarded-For` 等转发头：`auto` 只信任来自本机 / 内网的代理；`1` 总是；`0` 从不 |
+| `PROXY_PROTOCOL` | `off` | HAProxy PROXY protocol（v1/v2）：`on` 接受并优先使用负载均衡器在 TCP 层发来的真实客户端地址（`X-Forwarded-For` 无法伪造它）；`required` 同时拒绝没有该头的直连。见 [docs/DEPLOY.md](docs/DEPLOY.md) §2.5 |
+| `ACCOUNTS` | `off` | 注册/登录（邮箱验证码）开关，**默认关闭**（只有游客模式）：`off` = 关闭；`on`（旧名 `required`）= 开启，**SMTP 未配好则服务器拒绝启动**；`auto` = 配齐 SMTP 才开启 |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_SECURE` / `SMTP_USER` / `SMTP_PASS` / `SMTP_FROM` | 空 / `465` / `1` / 空 | 发验证码用的 SMTP：主机、端口、`1`=直连 TLS（465）/`0`=STARTTLS（587）、登录名、密码或**授权码**、发件人（默认同登录名）。见 [docs/DEPLOY.md](docs/DEPLOY.md) §7 |
 | `DEBUG` | 空 | 设为任意值输出详细日志 |
 | `SP_NO_BROWSER` | 空 | 设为 `1` 时启动脚本不自动打开浏览器 |
 

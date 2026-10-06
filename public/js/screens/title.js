@@ -1,19 +1,28 @@
-// Title screen: season-style backdrop, big title 卫戍协议：盟约, remembered nickname, 开始.
+// Title screen: season-style backdrop, big title 卫戍协议：盟约, remembered nickname, 开始, and a minimal account
+// panel (登录 / 注册, DESIGN §25) beside the guest flow.
 //
 // Pressing 开始 validates the nickname (1..NAME_MAX_LEN chars, no control characters), stores it,
 // marks this tab as "entered" (so reloads skip the title) and hands the name to net.js, which
 // sends `hello` (now, or as soon as the socket is open). The router then shows the lobby.
 //
+// The account panel is optional: 开始 stays the guest path and is unchanged. 注册 takes two steps — an e-mail, 发送验证码,
+// then the 6-digit code + 昵称 + password — and 登录 is an e-mail and a password. The server answers `auth.ok` with the
+// account token; main.js stores it and every later `hello` carries it as `auth`, so any device that proves it becomes
+// the same player (the same seat, room and match). An older server that does not know the intents — or one with the
+// account feature off (`ACCOUNTS=off`, no SMTP) — hides the panel entirely and the guest flow carries on; a login that
+// fails shows its reason in the panel, never as a toast.
+//
 // Backdrop art: if data/assets.json lists a UI backdrop (`ui.titleBackdrop`, or one of the
 // entry/loading illustration names) it is layered under the CSS art; otherwise the screen is
 // pure CSS/SVG (radar, ridgelines, glow), so it never issues a request that can 404.
 
-import { useMemo, useState } from '../../vendor/hooks.module.js';
+import { useEffect, useMemo, useRef, useState } from '../../vendor/hooks.module.js';
 import { NAME_MAX_LEN, APP_VERSION } from '../../../shared/constants.js';
+import { ACCOUNT, EMAIL_RE } from '../../../shared/protocol.js';
 import { html, Button, Icon, MicroLabel, TextField, PingPill } from '../ui/components.js';
 import { GuideButton } from '../ui/guide.js';
 import { toast } from '../ui/toasts.js';
-import { net, identity } from '../net.js';
+import { net, identity, authErrorText } from '../net.js';
 import { store, useStore, shallowEqual } from '../store.js';
 import { data, useData } from '../data.js';
 import { FullscreenButton, detectFeatures } from '../ui/device.js';
@@ -180,11 +189,235 @@ const STATUS_TEXT = {
   online: '已连接服务器', reconnecting: '连接中断，正在重连', closed: '连接已关闭',
 };
 
+/**
+ * Password box in the TextField look: ui/components.js TextField has no `type` prop and is shared with every other
+ * screen, so this twin repeats its markup (same `field` classes, same composition handling) with `type="password"`.
+ * Enter submits, exactly like the CALLSIGN field above it.
+ */
+function PasswordField({ label = '密码', micro, value, onInput, onEnter, placeholder = `输入密码（至少 ${ACCOUNT.passwordMin} 位）`, autoComplete, disabled, autoFocus, hint, invalid }) {
+  const composing = useRef(false);
+  const inputRef = useRef(null);
+  const id = useMemo(() => `pw-${Math.random().toString(36).slice(2, 8)}`, []);
+  useEffect(() => { if (autoFocus) setTimeout(() => inputRef.current?.focus(), 60); }, []);
+  const handle = (e) => { if (!composing.current) onInput?.(e.currentTarget.value); };
+  return html`<label class=${`field field--md${invalid ? ' is-invalid' : ''}`} for=${id}>
+    <span class="field__label">${label}${micro ? html`<span class="micro">${micro}</span>` : null}</span>
+    <span class="field__box brackets">
+      <${Icon} name="key" class="field__icon" />
+      <input id=${id} ref=${inputRef} class="field__input" type="password" name="password" value=${value}
+        placeholder=${placeholder} maxLength=${ACCOUNT.passwordMax} disabled=${disabled}
+        autocomplete=${autoComplete || 'current-password'} spellcheck=${false}
+        onInput=${handle}
+        oncompositionstart=${() => { composing.current = true; }}
+        oncompositionend=${(e) => { composing.current = false; handle(e); }}
+        onKeyDown=${(e) => { if (e.key === 'Enter' && !e.isComposing && !composing.current) onEnter?.(e); }} />
+    </span>
+    ${hint ? html`<span class="field__hint">${hint}</span>` : null}
+  </label>`;
+}
+
+/**
+ * E-mail box in the TextField look (shared with every screen's CALLSIGN field): ui/components.js TextField is fine
+ * as it is, so the account panel uses it — this wrapper only fixes the label/micro a caller of the panel would repeat.
+ */
+function EmailField({ value, onInput, onEnter, disabled, invalid, autoFocus }) {
+  return html`<${TextField} label="邮箱" micro="E-MAIL" size="md" icon="link" name="email" value=${value}
+    maxLength=${ACCOUNT.emailMax} placeholder="you@example.com" invalid=${invalid} disabled=${disabled}
+    autoFocus=${autoFocus} onInput=${onInput} onEnter=${onEnter} />`;
+}
+
+/** Verification-code box (6 digits, numeric keypad on phones). */
+function CodeField({ value, onInput, onEnter, disabled, invalid }) {
+  const composing = useRef(false);
+  const id = useMemo(() => `code-${Math.random().toString(36).slice(2, 8)}`, []);
+  return html`<label class=${`field field--md${invalid ? ' is-invalid' : ''}`} for=${id}>
+    <span class="field__label">验证码<span class="micro">CODE</span></span>
+    <span class="field__box brackets">
+      <${Icon} name="key" class="field__icon" />
+      <input id=${id} class="field__input" type="text" name="code" inputmode="numeric" autocomplete="one-time-code"
+        spellcheck=${false} maxLength=${ACCOUNT.codeLength} placeholder=${'0'.repeat(ACCOUNT.codeLength)} value=${value}
+        disabled=${disabled}
+        onInput=${(e) => { if (!composing.current) onInput?.(e.currentTarget.value.replace(/[^0-9]/g, '')); }}
+        oncompositionstart=${() => { composing.current = true; }}
+        oncompositionend=${(e) => { composing.current = false; onInput?.(e.currentTarget.value.replace(/[^0-9]/g, '')); }}
+        onKeyDown=${(e) => { if (e.key === 'Enter' && !e.isComposing && !composing.current) onEnter?.(e); }} />
+    </span>
+  </label>`;
+}
+
+/** Big, centred 6-digit message: the one line the mail carries. */
+const CODE_SENT_TEXT = (ttlSec) => `验证码已发送（${Math.round(ttlSec / 60)} 分钟内有效）`;
+
+const AUTH_MODE = { LOGIN: 'login', REGISTER: 'register' };
+
+/**
+ * Account panel under 开始 (server/accounts.js, DESIGN §25): 账号登录 (e-mail + password) or 注册 in two steps —
+ * e-mail → 发送验证码, then 验证码 + 昵称 + 密码 → 完成注册 — or the signed-in account with 退出. A guest is the default
+ * and 开始 is untouched: an account only adds the stable playerId behind the name, which is what lets the same player
+ * take over their seat from another device (the phone signs in with the same address and password and the server
+ * closes the other socket with 4001 for it).
+ *
+ * The panel hides itself when the server has no account feature (`store.ui.accountsOff`: ACCOUNTS=off, an incomplete
+ * SMTP configuration, an older server — see main.js), and every failure is shown here, never as a toast.
+ *
+ * @param {{ name: string, autoFocusPassword?: boolean }} props the current 博士代号 value (the nickname a registration
+ *   is filed under); touch devices pass `autoFocusPassword: false` (an on-screen keyboard would cover the panel)
+ */
+function AuthPanel({ name, autoFocusPassword = false }) {
+  const account = useStore((s) => s.account);
+  const accountsOff = useStore((s) => !!s.ui.accountsOff);
+  const [mode, setMode] = useState(AUTH_MODE.LOGIN);
+  const [open, setOpen] = useState(false);
+  const [email, setEmail] = useState('');
+  const [sentEmail, setSentEmail] = useState('');
+  const [code, setCode] = useState('');
+  const [password, setPassword] = useState('');
+  const [wait, setWait] = useState(0);   // seconds left before another code may be asked for
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  // the 60 s resend countdown (one timer per second while it runs)
+  useEffect(() => {
+    if (wait <= 0) return undefined;
+    const t = setTimeout(() => setWait((s) => (s > 0 ? s - 1 : 0)), 1000);
+    return () => clearTimeout(t);
+  }, [wait]);
+
+  const address = email.trim().toLowerCase();
+  const emailOk = address.length > 0 && address.length <= ACCOUNT.emailMax && EMAIL_RE.test(address);
+  const nickname = sanitizeName(name);
+  const codeOk = new RegExp(`^[0-9]{${ACCOUNT.codeLength}}$`).test(code);
+
+  const pick = (m) => { setMode(m); setOpen(true); setError(''); };
+  const reset = () => { setPassword(''); setCode(''); setError(''); };
+
+  /** Leave the account: forget the token *before* asking the server, so a failed request can never re-login us. */
+  const signOut = () => {
+    identity.clearAccountToken();
+    store.set({ account: null });
+    setOpen(false);
+    reset();
+    net.request('auth.logout').catch(() => {}); // best effort: revoke the credential server-side too
+    toast('已退出账号，将以游客身份开始', 'info');
+  };
+
+  /** Step 1: mail a code to the address in the field. */
+  const sendCode = async () => {
+    if (busy) return;
+    if (!emailOk) { setError(authErrorText('bad_email')); return; }
+    setBusy(true);
+    setError('');
+    try {
+      const res = await net.request('auth.requestCode', { email: address }, { session: false });
+      setSentEmail(res?.email ? String(res.email) : address);
+      setCode('');
+      setWait(ACCOUNT.resendSec);
+    } catch (err) {
+      setError(authErrorText(err?.code, err?.serverMsg || err?.message));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Step 2: prove the address, name the account and set a password. */
+  const submitRegister = async () => {
+    if (busy) return;
+    if (!sentEmail) { setError(authErrorText('bad_email')); return; }
+    if ([...nickname].length < ACCOUNT.nameMin) { setError(authErrorText('bad_name')); return; }
+    if (!codeOk) { setError(authErrorText('bad_code')); return; }
+    if ([...password].length < ACCOUNT.passwordMin) { setError(authErrorText('bad_password')); return; }
+    setBusy(true);
+    setError('');
+    try {
+      // No session of our own yet: the server creates one for the account and answers `welcome` (with the session
+      // token) right after `auth.ok`, which is what main.js stores.
+      const msg = await net.request('auth.register', { email: sentEmail, code, name: nickname, password }, { session: false });
+      reset();
+      setOpen(false);
+      setSentEmail('');
+      toast(`注册成功，已登录：${msg.name}`, 'success');
+    } catch (err) {
+      setError(authErrorText(err?.code, err?.serverMsg || err?.message));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submitLogin = async () => {
+    if (busy) return;
+    if (!emailOk) { setError(authErrorText('bad_email')); return; }
+    if (!password) { setError(authErrorText('bad_credentials')); return; }
+    setBusy(true);
+    setError('');
+    try {
+      const msg = await net.request('auth.login', { email: address, password }, { session: false });
+      reset();
+      setOpen(false);
+      toast(`已登录：${msg.name}`, 'success');
+    } catch (err) {
+      setError(authErrorText(err?.code, err?.serverMsg || err?.message));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // This server has no account feature at all (ACCOUNTS=off, no SMTP, or an older server): no entries, and one quiet
+  // line so the missing login button is explained rather than mysterious.
+  if (accountsOff) return html`<${MicroLabel}>当前服务器未开启账号系统，请以游客身份开始<//>`;
+
+  const rowStyle = 'display:flex;align-items:center;gap:.08rem';
+  const registerStep2 = mode === AUTH_MODE.REGISTER && !!sentEmail;
+  return html`<div style="display:flex;flex-direction:column;gap:.1rem">
+    ${account ? html`<div style=${rowStyle}>
+      <span class="status-dot is-on"></span>
+      <${MicroLabel}>ACCOUNT<//>
+      <b style="color:var(--mint-glow);font-size:.15rem">${account.name}</b>
+      <span style="flex:1"></span>
+      <${Button} size="sm" variant="ghost" icon="exit" title="退出账号" onClick=${signOut}>退出<//>
+    </div>` : html`<div style=${rowStyle}>
+      <${Button} size="sm" variant="ghost" block=${true} icon="key" active=${open && mode === AUTH_MODE.LOGIN}
+        onClick=${() => pick(AUTH_MODE.LOGIN)}>账号登录<//>
+      <${Button} size="sm" variant="ghost" block=${true} icon="plus" active=${open && mode === AUTH_MODE.REGISTER}
+        onClick=${() => pick(AUTH_MODE.REGISTER)}>注册<//>
+    </div>`}
+
+    ${!account && open && mode === AUTH_MODE.LOGIN ? html`<${EmailField} value=${email} disabled=${busy}
+      invalid=${!!error} autoFocus=${autoFocusPassword} onInput=${setEmail} onEnter=${submitLogin} />` : null}
+    ${!account && open && mode === AUTH_MODE.LOGIN ? html`<${PasswordField} value=${password} micro="PASSWORD"
+      disabled=${busy} invalid=${!!error} autoComplete="current-password" onInput=${setPassword} onEnter=${submitLogin} />` : null}
+    ${!account && open && mode === AUTH_MODE.LOGIN ? html`<${Button} variant="secondary" size="md" block=${true} loading=${busy}
+      icon="check" disabled=${busy || !emailOk || !password} onClick=${submitLogin}>登录<//>` : null}
+
+    ${!account && open && mode === AUTH_MODE.REGISTER ? html`<${EmailField} value=${email} disabled=${busy}
+      invalid=${!!error} autoFocus=${autoFocusPassword} onInput=${setEmail} onEnter=${sendCode} />` : null}
+    ${!account && open && mode === AUTH_MODE.REGISTER ? html`<${Button} variant=${registerStep2 ? 'ghost' : 'secondary'} size="md"
+      block=${true} loading=${busy && !registerStep2} icon=${registerStep2 ? 'refresh' : 'key'} disabled=${busy || !emailOk || wait > 0}
+      onClick=${sendCode}>${registerStep2 ? (wait > 0 ? `重发（${wait}s）` : '重新发送验证码') : '发送验证码'}<//>` : null}
+    ${!account && open && registerStep2 ? html`<${MicroLabel}>${CODE_SENT_TEXT(ACCOUNT.codeTtlSec)}<//>` : null}
+    ${!account && open && registerStep2 ? html`<${CodeField} value=${code} disabled=${busy} invalid=${!!error}
+      onInput=${setCode} onEnter=${submitRegister} />` : null}
+    ${!account && open && registerStep2 ? html`<${PasswordField} value=${password} micro="NEW PASSWORD"
+      disabled=${busy} invalid=${!!error} autoComplete="new-password" onInput=${setPassword} onEnter=${submitRegister} />` : null}
+    ${!account && open && registerStep2 ? html`<${Button} variant="secondary" size="md" block=${true} loading=${busy}
+      icon="plus" disabled=${busy || !codeOk || !password} onClick=${submitRegister}>完成注册<//>` : null}
+    ${!account && open && registerStep2 ? html`<${MicroLabel}>昵称用上方的博士代号：${nickname || '（请先填写）'}<//>` : null}
+
+    ${!account && open && mode === AUTH_MODE.REGISTER ? html`<${MicroLabel}>注册后可在手机等设备上登录，继续同一局<//>` : null}
+    ${!account && open && mode === AUTH_MODE.LOGIN ? html`<${MicroLabel}>登录后可在其他设备接管当前同盟与对局<//>` : null}
+    ${!account && !open ? html`<${MicroLabel}>账号可选：以游客身份也可直接开始<//>` : null}
+    ${error ? html`<div style="font-size:.13rem;color:var(--red-premium);line-height:1.4">${error}</div>` : null}
+  </div>`;
+}
+
 /** Title screen component. */
 export function TitleScreen() {
   const conn = useStore((s) => s.connection, shallowEqual);
   const pendingJoin = useStore((s) => s.ui.pendingJoin);
+  const accountName = useStore((s) => s.account?.name ?? null);
   const [name, setName] = useState(() => store.get().me.name || identity.loadName() || '');
+  // Signing in renames the player server-side (the account's name wins): show that name in the field the guest 开始
+  // button sends, so pressing 开始 right after a login keeps the identity the account was bound with.
+  useEffect(() => { if (accountName) setName(sanitizeName(accountName)); }, [accountName]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const assetsSettled = useData('assets');
   const assets = data.get('assets');
@@ -256,6 +489,7 @@ export function TitleScreen() {
           placeholder="输入你的代号（最多 ${NAME_MAX_LEN} 字）" autoFocus=${!touchUi}
           onInput=${setName} onEnter=${start} />
         <${Button} variant="primary" size="xl" block=${true} iconRight="chevrons" disabled=${!valid} onClick=${start}>开始<//>
+        <${AuthPanel} name=${name} autoFocusPassword=${!touchUi} />
         <div class="title-conn">
           <span class=${`status-dot ${dotClass}`}></span>
           <span>${STATUS_TEXT[conn.status] || conn.status}</span>

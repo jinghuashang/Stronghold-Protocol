@@ -235,11 +235,71 @@ const target = (v) => {
   return false;
 };
 
+// ---- accounts (server/accounts.js, DESIGN §25): e-mail + verification code, the token a hello may carry ----------
+
+/**
+ * Account rules — the one place the browser form (public/js/screens/title.js), the validation below and the server
+ * module (server/accounts.js) agree on, so a request the form accepts is never refused by the wire (and vice versa).
+ *
+ * `nameMax` is `hello.name`'s own cap: the nickname travels back as a session name (`hello.name`, `session.name`), so
+ * an account nickname a session could not carry is not a usable nickname. [ASSUMED]: the e-mail-registration ticket
+ * said 「3–24 字」, but this repository's `NAME_MAX_LEN` is 12 and a longer name would be silently truncated by
+ * `sanitizeName` on the way to a seat — refusing it is honest, truncating it would rename the player.
+ *
+ * The code limits are the anti-abuse budget of a public, mail-sending endpoint: one code per address per minute, five
+ * per hour per address, twenty per hour per client address (accounts.js counts them), ten minutes of validity, five
+ * wrong tries void the code.
+ */
+export const ACCOUNT = Object.freeze({
+  nameMin: 3,
+  nameMax: NAME_MAX_LEN, // 12
+  passwordMin: 6,
+  passwordMax: 128,
+  emailMax: 254,
+  codeLength: 6,
+  codeTtlSec: 600,        // a code lives 10 minutes
+  resendSec: 60,          // …and one address gets one per minute
+  codesPerHour: 5,        // …five per hour,
+  codesPerHourPerIp: 20,  // …twenty per hour per client address
+  codeTries: 5,           // five wrong tries void the code
+  tokenMaxLen: 64,        // 32 random bytes base64url = 43 chars
+  tokens: 5,              // account tokens kept per account (the oldest is rotated out)
+});
+
+/** A syntactically plausible e-mail address (`something@domain.tld`, no spaces). */
+export const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const isEmail = (v) => typeof v === 'string' && v.length > 0 && v.length <= ACCOUNT.emailMax && EMAIL_RE.test(v);
+const isAccountToken = (v) => typeof v === 'string' && v.length > 0 && v.length <= ACCOUNT.tokenMaxLen && /^[A-Za-z0-9_-]+$/.test(v);
+const cpLen = (v) => [...v].length;
+/** The 6-digit code of `auth.codeSent`. */
+const isCode = (v) => typeof v === 'string' && v.length === ACCOUNT.codeLength && /^[0-9]+$/.test(v);
+/** A *new* nickname (see ACCOUNT.nameMin/nameMax; the server re-sanitizes it with net.js sanitizeName). */
+const isNewName = (v) => typeof v === 'string' && v.length <= ACCOUNT.nameMax && cpLen(v) >= ACCOUNT.nameMin && v.trim() === v;
+/** A new password: the full rule (code points, so a CJK passphrase is measured like the player counts it). */
+const isNewPassword = (v) => typeof v === 'string' && cpLen(v) >= ACCOUNT.passwordMin && cpLen(v) <= ACCOUNT.passwordMax;
+// `auth.login` is deliberately lax about the *password* only: a password that could never have been registered must be
+// answered by accounts.js with `bad_credentials`, not with a protocol error that would tell the caller it cannot exist.
+const isLoginPassword = (v) => typeof v === 'string' && v.length > 0 && v.length <= ACCOUNT.passwordMax;
+
 /** @type {Record<string, Record<string, (v:any)=>boolean> & { $optional?: string[] }>} */
 export const C2S = {
   // session & lobby
-  hello: { name: (v) => isStr(v, NAME_MAX_LEN) && v.trim().length > 0, token: (v) => v == null || isStr(v, 64), version: (v) => v == null || isInt(v, 0, 1e6), $optional: ['token', 'version'] },
+  // `auth` (optional): the account token (server/accounts.js) — proof of an account on this socket. The server binds
+  // the session's playerId to the account's stable one, taking over the account's live session when another device
+  // holds it (`welcome { resumed }` + a full resync, the old socket closed with 4001); an unknown token is answered by
+  // an unsolicited `auth.error { code: 'bad_token' }` while the hello is served as a guest (graceful fallback).
+  hello: { name: (v) => isStr(v, NAME_MAX_LEN) && v.trim().length > 0, token: (v) => v == null || isStr(v, 64), version: (v) => v == null || isInt(v, 0, 1e6), auth: (v) => v == null || isAccountToken(v), $optional: ['token', 'version', 'auth'] },
   ping: { c: (v) => typeof v === 'number' && Number.isFinite(v) },
+  // accounts (server/accounts.js, DESIGN §25): the e-mail is the account key, so registration is two steps —
+  // `auth.requestCode {email}` mails a 6-digit code (`auth.codeSent {email, ttlSec}`), then
+  // `auth.register {email, code, name, password}` consumes it (once) and answers `auth.ok {playerId, name, token}`.
+  // `auth.login {email, password}` needs no code; `auth.logout` revokes the token the session was bound with. Every
+  // refusal is `auth.error {code, message}` — `accounts_disabled` when the server has no SMTP configured, so the
+  // client hides the entries instead of offering a flow that cannot work.
+  'auth.requestCode': { email: isEmail },
+  'auth.register': { email: isEmail, code: isCode, name: isNewName, password: isNewPassword },
+  'auth.login': { email: isEmail, password: isLoginPassword },
+  'auth.logout': {},
   'room.create': { mode: (v) => v === 'solo' || v === 'coop', difficulty: (v) => DIFFICULTIES.includes(v) },
   'room.join': { code: (v) => isStr(v, ROOM_CODE_LEN + 2) && /^[A-Za-z0-9]+$/.test(v) },
   'room.leave': {},
@@ -308,6 +368,13 @@ export const C2S = {
 // Server → client message types (documentation + client dispatch table keys).
 export const S2C = [
   'welcome', 'ok', 'error', 'pong',
+  // accounts (server/accounts.js, DESIGN §25): auth.codeSent { email, ttlSec } — the verification code is on its way;
+  // auth.ok { playerId, name, token } — the account is bound to this session (token = the account token, the session's
+  // own reconnect token still arrives in `welcome`); auth.error { code, message } — refused (carries the request's rid
+  // when it answers an auth.* request, none at all when a `hello.auth` token was not recognised: the hello itself is
+  // then served as a guest). Codes: code_sent | bad_code | code_expired | too_many | email_taken | bad_email |
+  // bad_name | bad_password | bad_credentials | accounts_disabled | smtp_failed | in_room | no_session | bad_token.
+  'auth.codeSent', 'auth.ok', 'auth.error',
   'room.state', 'room.closed',
   'm.public', 'm.private', 'm.field', 'm.toast', 'm.ticker', 'm.emote', 'm.result',
   // m.unitStats { seq, round, units: [unitStatsEntry] } — the answer to g.unitStats (the requester only)
