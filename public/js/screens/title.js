@@ -271,6 +271,7 @@ function AuthPanel({ name, autoFocusPassword = false }) {
   const [email, setEmail] = useState('');
   const [sentEmail, setSentEmail] = useState('');
   const [code, setCode] = useState('');
+  const [nickname, setNickname] = useState('');
   const [password, setPassword] = useState('');
   const [wait, setWait] = useState(0);   // seconds left before another code may be asked for
   const [busy, setBusy] = useState(false);
@@ -285,10 +286,21 @@ function AuthPanel({ name, autoFocusPassword = false }) {
 
   const address = email.trim().toLowerCase();
   const emailOk = address.length > 0 && address.length <= ACCOUNT.emailMax && EMAIL_RE.test(address);
-  const nickname = sanitizeName(name);
+  // The nickname lives in the panel, not in the guest 博士代号 field above it: a player who never pressed 开始 has no
+  // reason to connect the two, and a disabled 完成注册 buttons explains nothing (the field is prefilled from the guest
+  // field when the panel opens, and the guest field is synced back once the account exists).
+  const nick = sanitizeName(nickname);
+  const nickOk = [...nick].length >= ACCOUNT.nameMin;
   const codeOk = new RegExp(`^[0-9]{${ACCOUNT.codeLength}}$`).test(code);
+  // What is still missing, said out loud next to the button (a disabled button alone is the trap this fixes).
+  const nickHint = !nickname.trim() ? `请输入昵称（${ACCOUNT.nameMin}–${ACCOUNT.nameMax} 字）` : (nickOk ? '' : `昵称需 ${ACCOUNT.nameMin}–${ACCOUNT.nameMax} 字，当前 ${[...nick].length} 字`);
 
-  const pick = (m) => { setMode(m); setOpen(true); setError(''); };
+  const pick = (m) => {
+    if (m === AUTH_MODE.REGISTER) setNickname((v) => v || sanitizeName(name)); // prefill from the guest field
+    setMode(m);
+    setOpen(true);
+    setError('');
+  };
   const reset = () => { setPassword(''); setCode(''); setError(''); };
 
   /** Leave the account: forget the token *before* asking the server, so a failed request can never re-login us. */
@@ -305,11 +317,10 @@ function AuthPanel({ name, autoFocusPassword = false }) {
   const sendCode = async () => {
     if (busy) return;
     if (!emailOk) { setError(authErrorText('bad_email')); return; }
-    const reset = mode === AUTH_MODE.RESET;
     setBusy(true);
     setError('');
     try {
-      const res = await net.request(reset ? 'auth.requestReset' : 'auth.requestCode', { email: address }, { session: false });
+      const res = await net.request(mode === AUTH_MODE.RESET ? 'auth.requestReset' : 'auth.requestCode', { email: address }, { session: false });
       setSentEmail(res?.email ? String(res.email) : address);
       setCode('');
       setWait(ACCOUNT.resendSec);
@@ -324,7 +335,7 @@ function AuthPanel({ name, autoFocusPassword = false }) {
   const submitRegister = async () => {
     if (busy) return;
     if (!sentEmail) { setError(authErrorText('bad_email')); return; }
-    if ([...nickname].length < ACCOUNT.nameMin) { setError(authErrorText('bad_name')); return; }
+    if (!nickOk) { setError(authErrorText('bad_name')); return; }
     if (!codeOk) { setError(authErrorText('bad_code')); return; }
     if ([...password].length < ACCOUNT.passwordMin) { setError(authErrorText('bad_password')); return; }
     setBusy(true);
@@ -332,7 +343,7 @@ function AuthPanel({ name, autoFocusPassword = false }) {
     try {
       // No session of our own yet: the server creates one for the account and answers `welcome` (with the session
       // token) right after `auth.ok`, which is what main.js stores.
-      const msg = await net.request('auth.register', { email: sentEmail, code, name: nickname, password }, { session: false });
+      const msg = await net.request('auth.register', { email: sentEmail, code, name: nick, password }, { session: false });
       reset();
       setOpen(false);
       setSentEmail('');
@@ -420,6 +431,11 @@ function AuthPanel({ name, autoFocusPassword = false }) {
       <${MicroLabel}>用邮箱重置密码，无需旧密码<//>
     </div>` : null}
 
+    ${!account && open && isRegister ? html`<${TextField} label="昵称" micro="CALLSIGN" size="md" icon="user" name="nickname"
+      value=${nickname} maxLength=${NAME_MAX_LEN} invalid=${!nickOk && !!nickname.trim()}
+      placeholder=${`输入你的代号（最多 ${NAME_MAX_LEN} 字）`}
+      onInput=${setNickname} onEnter=${step2 ? submitStep2 : sendCode} />` : null}
+    ${!account && open && isRegister && nickHint ? html`<${MicroLabel}>${nickHint}<//>` : null}
     ${!account && open && codeFlow ? html`<${EmailField} value=${email} disabled=${busy}
       invalid=${!!error} autoFocus=${autoFocusPassword} onInput=${setEmail} onEnter=${sendCode} />` : null}
     ${!account && open && codeFlow ? html`<${Button} variant=${step2 ? 'ghost' : 'secondary'} size="md"
@@ -431,8 +447,10 @@ function AuthPanel({ name, autoFocusPassword = false }) {
     ${!account && open && step2 ? html`<${PasswordField} value=${password} micro=${isReset ? 'NEW PASSWORD' : 'NEW PASSWORD'}
       disabled=${busy} invalid=${!!error} autoComplete="new-password" onInput=${setPassword} onEnter=${submitStep2} />` : null}
     ${!account && open && step2 ? html`<${Button} variant="secondary" size="md" block=${true} loading=${busy}
-      icon=${isReset ? 'refresh' : 'plus'} disabled=${busy || !codeOk || !password} onClick=${submitStep2}>${isReset ? '重置并登录' : '完成注册'}<//>` : null}
-    ${!account && open && step2 && isRegister ? html`<${MicroLabel}>昵称用上方的博士代号：${nickname || '（请先填写）'}<//>` : null}
+      icon=${isReset ? 'refresh' : 'plus'} disabled=${busy || !codeOk || !password || (isRegister && !nickOk)} onClick=${submitStep2}>${isReset ? '重置并登录' : '完成注册'}<//>` : null}
+    ${!account && open && step2 && isRegister ? html`<${MicroLabel}>${nickOk
+      ? `昵称：${nick}`
+      : `填写上方的昵称即可完成注册（${nickHint}）`}<//>` : null}
     ${!account && open && codeFlow ? html`<${MicroLabel}>${isReset
       ? '重置成功后其他设备会全部退出登录，本机直接进入已登录状态'
       : '注册后可在手机等设备上登录，继续同一局'}<//>` : null}

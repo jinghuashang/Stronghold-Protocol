@@ -606,6 +606,35 @@ describe('accounts: on-disk store', () => {
   });
 });
 
+describe('accounts: the title panel stands on its own (static)', () => {
+  // The trap this guards: the registration panel used to take its nickname from the guest 博士代号 field above it, so a
+  // player who never pressed 开始 saw a 完成注册 button that never enabled and no reason why. The panel now owns the
+  // nickname, prefills it from that field, and says what is missing next to the button.
+  const src = readFileSync(new URL('../public/js/screens/title.js', import.meta.url), 'utf8');
+
+  test('the register panel owns its nickname field', () => {
+    assert.ok(src.includes('name="nickname"'), 'a nickname input inside the panel');
+    assert.ok(src.includes('label="昵称"'), 'labelled 昵称');
+    assert.ok(src.includes('setNickname((v) => v || sanitizeName(name))'), 'prefilled from the guest field when it opens');
+    assert.ok(src.includes('{ email: sentEmail, code, name: nick, password }'), 'the register payload uses the panel nickname');
+    assert.ok(!src.includes('昵称用上方的博士代号'), 'the cross-panel hint is gone');
+  });
+
+  test('完成注册 depends on the panel fields alone, and says what is missing', () => {
+    assert.ok(src.includes('disabled=${busy || !codeOk || !password || (isRegister && !nickOk)}'), 'the enable condition');
+    assert.ok(src.includes('const nickOk = [...nick].length >= ACCOUNT.nameMin'), 'the 3-character rule');
+    assert.ok(src.includes('请输入昵称（${ACCOUNT.nameMin}–${ACCOUNT.nameMax} 字）'), 'an explicit reason when it is empty');
+    assert.ok(src.includes('填写上方的昵称即可完成注册'), 'the reason is repeated next to the button');
+    assert.ok(src.includes('昵称需 ${ACCOUNT.nameMin}–${ACCOUNT.nameMax} 字，当前 ${[...nick].length} 字'), 'and when it is too short');
+  });
+
+  test('the guest field is synced from the account name, and 忘记密码 needs no nickname', () => {
+    assert.ok(src.includes('if (accountName) setName(sanitizeName(accountName))'), 'the guest 博士代号 follows the account');
+    assert.ok(src.includes("mode === AUTH_MODE.RESET ? 'auth.requestReset'"), 'the reset flow asks for its own code');
+    assert.ok(src.includes("await net.request('auth.resetPassword', { email: sentEmail, code, password }"), 'and it never sends a nickname');
+  });
+});
+
 describe('accounts: protocol (shared/protocol.js)', () => {
   test('the wire accepts exactly what the module accepts', () => {
     assert.equal(validateC2S({ t: 'auth.requestCode', email: EMAIL }), null);
