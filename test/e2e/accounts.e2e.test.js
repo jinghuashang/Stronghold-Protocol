@@ -213,7 +213,7 @@ describe('accounts end to end (wired server)', () => {
     await seated.close();
   });
 
-  test('accounts are opt-in: no ACCOUNTS at all (and ACCOUNTS=off) means off, and every intent says so', async () => {
+  test('the accounts are built in but off without SMTP: every intent says so, and ACCOUNTS=off forces it', async () => {
     const cap2 = noopLog();
     // nothing in the environment: the DEFAULT is off, whatever SMTP_HOST/SMTP_FROM might say in the shell
     const plain = await startServer({ port: 0, host: '127.0.0.1', log: cap2.log, MatchClass: StubMatch, env: {} });
@@ -221,7 +221,7 @@ describe('accounts end to end (wired server)', () => {
       const h = await healthz(plain.port);
       assert.equal(h.accounts, 'off');
       assert.equal(plain.accounts, null);
-      assert.equal(plain.accountsState.mode, 'off');
+      assert.equal(plain.accountsState.mode, 'auto', 'an unset ACCOUNTS is auto: SMTP decides');
       assert.equal(plain.accountsState.error, null);
       const c = await TestClient.connect(`ws://127.0.0.1:${plain.port}/ws`);
       const res = await auth(c, { t: 'auth.requestCode', email: EMAIL }, 'auth.error');
@@ -253,6 +253,30 @@ describe('accounts end to end (wired server)', () => {
     }
   });
 
+  test('the accounts are built in: SMTP alone (no ACCOUNTS) turns them on', async () => {
+    // The user's own scenario: `npm start` in a deploy directory with only the SMTP settings present.
+    const cap3 = noopLog();
+    const auto = await startServer({
+      port: 0, host: '127.0.0.1', log: cap3.log, MatchClass: StubMatch,
+      env: { SMTP_HOST: '127.0.0.1', SMTP_PORT: String(relayPort), SMTP_FROM: 'noreply@stronghold.example' },
+      accountsFile: path.join(tmp, 'auto.json'),
+    });
+    try {
+      const h = await healthz(auto.port);
+      assert.equal(h.accounts, 'on', '/healthz.accounts');
+      assert.equal(auto.accountsState.mode, 'auto');
+      assert.equal(auto.accountsState.enabled, true);
+      assert.ok(auto.accounts, 'the store was created from the environment alone');
+      const c = await TestClient.connect(`ws://127.0.0.1:${auto.port}/ws`);
+      const sent = await auth(c, { t: 'auth.requestCode', email: 'autocase@rhodes.example' }, 'auth.codeSent');
+      assert.equal(sent.ttlSec, 600, 'a registration code really is mailed');
+      await c.close();
+    } finally {
+      await auto.close();
+      assert.deepEqual(cap3.errors, [], 'no errors logged for a complete configuration');
+    }
+  });
+
   test('ACCOUNTS=on (and its old alias required) without the SMTP settings refuses to start (exit 1, clear error)', () => {
     for (const ACCOUNTS of ['on', 'required']) {
       const env = { ...process.env, ACCOUNTS, PORT: '0' };
@@ -267,13 +291,13 @@ describe('accounts end to end (wired server)', () => {
     }
   });
 
-  test('with the accounts off, a plain start still comes up (the default must not block the game)', () => {
+  test('with no SMTP configured, a plain start still comes up (the default must not block the game)', () => {
     const env = { ...process.env, PORT: '0' };
     delete env.ACCOUNTS;
     // a short-lived child: it must reach "listening" and then be killed by the timeout (exit code null + signal)
     const r = spawnSync(process.execPath, [path.join(ROOT, 'server', 'index.js')], { env, encoding: 'utf8', timeout: 3000, killSignal: 'SIGKILL' });
     assert.equal(r.status, null, 'still running when the test killed it — it did not exit on its own');
-    assert.match(r.stdout + r.stderr, /\[accounts\] OFF/);
+    assert.match(r.stdout + r.stderr, /\[accounts\] 未配置 SMTP，账号系统未启用/);
   });
 
   test('找回密码 end to end: a reset code by mail → resetPassword → auth.ok + welcome, every older session cut off', async () => {

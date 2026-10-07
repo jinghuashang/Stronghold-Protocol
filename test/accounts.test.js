@@ -74,18 +74,50 @@ async function signUp(ctx, { email = EMAIL, name = '阿米娅', password = PASSW
 }
 
 describe('accounts: configuration (ACCOUNTS / SMTP_*)', () => {
-  test('the feature is opt-in: unset, blank, off-ish or unknown ACCOUNTS means off', () => {
-    const full = { SMTP_HOST: 'smtp.example', SMTP_FROM: 'noreply@stronghold.example' };
+  test('the accounts are built in: an unset ACCOUNTS means auto, and complete SMTP switches them on', () => {
+    const full = { SMTP_HOST: 'smtp.example', SMTP_USER: 'bot', SMTP_PASS: 'pw', SMTP_FROM: 'noreply@stronghold.example' };
     assert.deepEqual(ACCOUNTS_MODES, ['off', 'auto', 'on']);
-    for (const env of [{}, { ACCOUNTS: '' }, { ACCOUNTS: '   ' }, { ACCOUNTS: 'off' }, { ACCOUNTS: 'OFF' }, { ACCOUNTS: '0' }, { ACCOUNTS: 'no' }, { ACCOUNTS: 'false' }, { ACCOUNTS: 'nonsense' }, { ACCOUNTS: 'yes please' }]) {
+    for (const env of [{}, { ACCOUNTS: '' }, { ACCOUNTS: '   ' }, { ACCOUNTS: 'nonsense' }, { ACCOUNTS: 'yes please' }, { ACCOUNTS: undefined }]) {
       const state = accountsConfigState({ ...env, ...full });
-      assert.equal(state.mode, 'off', JSON.stringify(env));
-      assert.equal(state.enabled, false, JSON.stringify(env));
-      assert.equal(state.error, null, 'off is deliberate, not an error');
-      assert.equal(state.smtp, null);
+      assert.equal(state.mode, 'auto', JSON.stringify(env));
+      assert.equal(state.enabled, true, `SMTP is complete ⇒ on (${JSON.stringify(env)})`);
+      assert.equal(state.error, null, JSON.stringify(env));
+      assert.equal(state.smtp.host, 'smtp.example');
     }
-    assert.equal(accountsMode(undefined), 'off');
-    assert.equal(accountsMode(42), 'off');
+    assert.equal(accountsMode(undefined), 'auto');
+    assert.equal(accountsMode(42), 'auto');
+  });
+
+  test('auto without SMTP is simply off — npm start needs no variable and must not fail', () => {
+    for (const env of [{}, { ACCOUNTS: 'auto' }]) {
+      const state = accountsConfigState(env);
+      assert.equal(state.mode, 'auto', JSON.stringify(env));
+      assert.equal(state.enabled, false);
+      assert.equal(state.error, null, 'nothing configured is not an error');
+      assert.equal(state.smtp, null);
+      assert.deepEqual(state.missing, ['SMTP_HOST', 'SMTP_FROM']);
+    }
+  });
+
+  test('a half configuration under auto is a warning, never an exit', () => {
+    for (const env of [{ SMTP_HOST: 'smtp.example' }, { ACCOUNTS: 'auto', SMTP_HOST: 'smtp.example' }]) {
+      const state = accountsConfigState(env);
+      assert.equal(state.enabled, false, JSON.stringify(env));
+      assert.match(state.error, /incomplete SMTP configuration/);
+      assert.equal(state.mode, 'auto', 'auto never asks the caller to exit');
+    }
+  });
+
+  test('ACCOUNTS=off (and 0/no/false) switches the feature off whatever the environment says', () => {
+    const full = { SMTP_HOST: 'smtp.example', SMTP_FROM: 'noreply@stronghold.example' };
+    for (const ACCOUNTS of ['off', 'OFF', '0', 'no', 'false']) {
+      const state = accountsConfigState({ ACCOUNTS, ...full });
+      assert.equal(state.mode, 'off', ACCOUNTS);
+      assert.equal(state.enabled, false, ACCOUNTS);
+      assert.equal(state.error, null, 'off is deliberate, not an error');
+      assert.equal(state.smtp, null, ACCOUNTS);
+    }
+    assert.equal(accountsMode('no'), 'off');
   });
 
   test('ACCOUNTS=on (alias required) with a complete configuration is on', () => {
@@ -117,29 +149,6 @@ describe('accounts: configuration (ACCOUNTS / SMTP_*)', () => {
       assert.equal(invalid.enabled, false);
       assert.match(invalid.error, /invalid SMTP_FROM, SMTP_PORT|invalid SMTP_PORT, SMTP_FROM/);
     }
-  });
-
-  test('ACCOUNTS=auto is decided by the SMTP settings alone (never an exit)', () => {
-    const full = { SMTP_HOST: 'smtp.example', SMTP_FROM: 'noreply@stronghold.example' };
-    const none = accountsConfigState({ ACCOUNTS: 'auto' });
-    assert.equal(none.enabled, false);
-    assert.equal(none.error, null, 'nothing configured is not a mistake');
-    assert.deepEqual(none.missing, ['SMTP_HOST', 'SMTP_FROM']);
-    const on = accountsConfigState({ ACCOUNTS: 'auto', ...full });
-    assert.equal(on.enabled, true);
-    assert.equal(on.error, null);
-    const half = accountsConfigState({ ACCOUNTS: 'auto', SMTP_HOST: 'smtp.example' });
-    assert.equal(half.enabled, false);
-    assert.match(half.error, /incomplete SMTP configuration/);
-    assert.equal(half.mode, 'auto', 'auto never asks the caller to exit');
-  });
-
-  test('ACCOUNTS=off wins over a complete SMTP configuration', () => {
-    const off = accountsConfigState({ ACCOUNTS: 'off', SMTP_HOST: 'smtp.example', SMTP_FROM: 'noreply@stronghold.example' });
-    assert.equal(off.enabled, false);
-    assert.equal(off.error, null);
-    assert.equal(off.smtp, null);
-    assert.equal(off.mode, 'off');
   });
 });
 

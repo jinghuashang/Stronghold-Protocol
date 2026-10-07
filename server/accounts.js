@@ -73,24 +73,26 @@ const noopLog = { info() {}, warn() {}, error() {}, debug() {} };
 export const ACCOUNTS_MODES = Object.freeze(['off', 'auto', 'on']);
 
 /**
- * `ACCOUNTS` as one of the three modes. Anything that is not an explicit request to enable the feature is `off`: unset,
- * empty, `off`/`0`/`no`/`false` and every unrecognised value (a typo must never switch a password system on).
- * `on` (and its old alias `required`, plus `1`/`true`/`yes`) asks for accounts and refuses to start without SMTP;
- * `auto` enables them only when the SMTP settings are complete. `required` is reported as `on`.
+ * `ACCOUNTS` as one of the three modes. The default is `auto` — the accounts are *built in*: with the SMTP settings in
+ * place they switch themselves on, and without them the feature is simply off, so `npm start` never needs a variable
+ * (server/envfile.js reads a project-root `.env` for the operator who wants them on). Unset, empty and every
+ * unrecognised value behave like `auto` (a typo must not switch a password system on *or* silently take it away).
+ * `off` (and `0`/`no`/`false`) is the deliberate switch-off; `on` (and its old alias `required`, plus
+ * `1`/`true`/`yes`) asks for accounts and refuses to start without SMTP. `required` is reported as `on`.
  * @param {unknown} raw
  * @returns {'off' | 'auto' | 'on'}
  */
 export function accountsMode(raw) {
   const v = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (v === 'off' || v === '0' || v === 'false' || v === 'no') return 'off';
   if (v === 'on' || v === 'required' || v === '1' || v === 'true' || v === 'yes') return 'on';
-  if (v === 'auto') return 'auto';
-  return 'off';
+  return 'auto'; // unset / empty / anything else: SMTP decides
 }
 
 /**
  * Resolve the account feature's configuration from an environment (server/index.js calls this before starting).
  *
- * `off` (**the default**) — the feature is off: no store, no mail, and `auth.*` must answer `accounts_disabled` so the
+ * `auto` (**the default** — accounts are built in, SMTP decides) / `off` (deliberately off: no store, no mail, and `auth.*` must answer `accounts_disabled` so the
  * browser hides the panel and only offers 游客开始.
  * `on` (alias `required`) — the operator asked for accounts: a complete SMTP configuration enables them, an incomplete
  * one is a startup error the caller must print and exit on (no server players cannot register on).

@@ -52,6 +52,7 @@ import { MEDIA_PREFIX, AUDIO_EXTS } from '../shared/media.js';
 import { parseProxyProtocol, createProxyProtocolListener } from './proxyprotocol.js';
 import { accountsConfigState, createAccounts } from './accounts.js';
 import { createSmtp } from './smtp.js';
+import { loadEnvFile } from './envfile.js';
 
 /** Repository root. */
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -671,7 +672,9 @@ export async function startServer(opts = {}) {
       .catch(() => {});
     log.info('[accounts] registration & sign-in are ON 注册与登录已开启（验证码邮件经 SMTP 发送）');
   } else if (!accountsState.error) {
-    log.info('[accounts] OFF 账号系统未启用/默认关闭（要启用：ACCOUNTS=on 且配好 SMTP_*，或 ACCOUNTS=auto）');
+    // Built in and off by default only because there is no relay to mail through: say what to write, not just that it
+    // is off (the accounts turn themselves on as soon as these exist, in the file or in the environment).
+    log.info('[accounts] 未配置 SMTP，账号系统未启用（把 SMTP_HOST/SMTP_USER/SMTP_PASS/SMTP_FROM 写进项目根目录的 .env 即可自动开启，或设 ACCOUNTS=on 要求必须开启）');
   }
 
   const network = new Network({ registry, handler: lobby, log, options: netOptions, accounts });
@@ -808,6 +811,14 @@ function isMain() {
 async function main() {
   process.on('unhandledRejection', (e) => console.error('[process] unhandled rejection', e));
   process.on('uncaughtException', (e) => console.error('[process] uncaught exception', e));
+  // The project-root .env is read here, and only here: the CLI entry point. startServer() itself never loads a file,
+  // so tests and library callers see exactly the environment they were given (server/envfile.js: a variable that is
+  // already set to a non-empty value always wins over the file).
+  const envFile = loadEnvFile(path.join(ROOT, '.env'), { log: makeLogger(false) });
+  if (envFile.found) {
+    const skipped = envFile.skipped.length ? ` (kept from the environment: ${envFile.skipped.join(', ')})` : '';
+    console.log(`[env] loaded ${envFile.loaded} var(s) from .env${skipped}`);
+  } else console.log('[env] no .env (using the environment as-is)');
   let srv;
   try {
     srv = await startServer();
