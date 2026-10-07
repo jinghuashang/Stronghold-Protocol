@@ -263,6 +263,7 @@ export const ACCOUNT = Object.freeze({
   codesPerHourPerIp: 20,  // …twenty per hour per client address
   codeTries: 5,           // five wrong tries void the code
   tokenMaxLen: 64,        // 32 random bytes base64url = 43 chars
+  tokenTtlMs: 90 * 24 * 60 * 60 * 1000, // a device that has not been seen for 90 days is signed out (§25.1)
   tokens: 5,              // account tokens kept per account (the oldest is rotated out)
 });
 

@@ -247,6 +247,8 @@ function CodeField({ value, onInput, onEnter, disabled, invalid }) {
 
 /** Big, centred 6-digit message: the one line the mail carries. */
 const CODE_SENT_TEXT = (ttlSec) => `验证码已发送（${Math.round(ttlSec / 60)} 分钟内有效）`;
+/** The reset flow never says whether the address has an account (§25.8): a neutral wording for both cases. */
+const RESET_SENT_TEXT = (ttlSec) => `如果该邮箱已注册，验证码已发送（${Math.round(ttlSec / 60)} 分钟内有效）`;
 
 const AUTH_MODE = { LOGIN: 'login', REGISTER: 'register', RESET: 'reset' };
 
@@ -441,7 +443,7 @@ function AuthPanel({ name, autoFocusPassword = false }) {
     ${!account && open && codeFlow ? html`<${Button} variant=${step2 ? 'ghost' : 'secondary'} size="md"
       block=${true} loading=${busy && !step2} icon=${step2 ? 'refresh' : 'key'} disabled=${busy || !emailOk || wait > 0}
       onClick=${sendCode}>${step2 ? (wait > 0 ? `重发（${wait}s）` : '重新发送') : step1Label}<//>` : null}
-    ${!account && open && step2 ? html`<${MicroLabel}>${CODE_SENT_TEXT(ACCOUNT.codeTtlSec)}<//>` : null}
+    ${!account && open && step2 ? html`<${MicroLabel}>${isReset ? RESET_SENT_TEXT(ACCOUNT.codeTtlSec) : CODE_SENT_TEXT(ACCOUNT.codeTtlSec)}<//>` : null}
     ${!account && open && step2 ? html`<${CodeField} value=${code} disabled=${busy} invalid=${!!error}
       onInput=${setCode} onEnter=${submitStep2} />` : null}
     ${!account && open && step2 ? html`<${PasswordField} value=${password} micro=${isReset ? 'NEW PASSWORD' : 'NEW PASSWORD'}

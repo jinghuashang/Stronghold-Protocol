@@ -262,11 +262,16 @@ describe('accounts: e-mail verification codes', () => {
 });
 
 describe('accounts: password reset (找回密码)', () => {
-  test('a reset code goes to an existing address only, and reads as a reset mail', async () => {
+  test('an unknown address answers like a known one — and no mail is sent (anti-enumeration)', async () => {
     const ctx = mk();
-    assert.deepEqual(await ctx.accounts.requestResetCode('nobody@rhodes.example'), { ok: false, error: 'unknown_email' });
+    assert.deepEqual(await ctx.accounts.requestResetCode('nobody@rhodes.example'), { ok: true, ttlSec: ACCOUNT.codeTtlSec }, 'the same answer as for an account that exists');
     assert.deepEqual(await ctx.accounts.requestResetCode('nope'), { ok: false, error: 'bad_email' });
-    assert.equal(ctx.mail.mails.length, 0, 'no mail for an address without an account');
+    assert.equal(ctx.mail.mails.length, 0, 'and nothing is mailed');
+    // the attempt is counted like a real one, so the throttles cannot tell the two apart either
+    assert.deepEqual(await ctx.accounts.requestResetCode('nobody@rhodes.example'), { ok: false, error: 'too_many' }, 'the same one-a-minute answer a known address would get');
+    // a reset for an address with no account can never work, whatever code is offered
+    assert.deepEqual(await ctx.accounts.resetPassword({ email: 'nobody@rhodes.example', code: '123456', password: 'long-enough-1' }), { ok: false, error: 'code_expired' });
+
     await signUp(ctx);
     ctx.clock.now += ACCOUNT.resendSec * 1000;
     const res = await ctx.accounts.requestResetCode(EMAIL);
@@ -283,7 +288,9 @@ describe('accounts: password reset (找回密码)', () => {
     const ctx = mk();
     const registerCode = await codeFor(ctx);                 // a pending registration code
     ctx.clock.now += ACCOUNT.resendSec * 1000;
-    await ctx.accounts.requestResetCode(EMAIL).then((r) => assert.equal(r.ok, false, 'no account yet'));
+    const beforeRegister = ctx.mail.mails.length;
+    assert.deepEqual(await ctx.accounts.requestResetCode(EMAIL), { ok: true, ttlSec: ACCOUNT.codeTtlSec }, 'no account yet: the same answer, no mail');
+    assert.equal(ctx.mail.mails.length, beforeRegister, 'nothing was sent');
     // register with the registration code
     const reg = await ctx.accounts.register({ email: EMAIL, code: registerCode, name: '阿米娅', password: PASSWORD });
     assert.equal(reg.ok, true);
@@ -500,6 +507,61 @@ describe('accounts: registration & login', () => {
       assert.equal(ctx.accounts.verify(junk), null, JSON.stringify(junk));
     }
     assert.ok(ctx.accounts.verify(token));
+  });
+
+  test('a token dies after 90 days without use — sliding, and removed from the file at once', async () => {
+    const ctx = mk();
+    const reg = await signUp(ctx);
+    const idle = await ctx.accounts.login({ email: EMAIL, password: PASSWORD });
+    assert.ok(ctx.accounts.verify(reg.token), 'fresh tokens work');
+    // every use refreshes it: the window slides from the last verify
+    ctx.clock.now += ACCOUNT.tokenTtlMs - 1000;
+    assert.ok(ctx.accounts.verify(reg.token), 'still inside the window');
+    ctx.clock.now += 2000;
+    assert.ok(ctx.accounts.verify(reg.token), 'the touch moved the window forward');
+    // the other device was never used: it is the one that expires, right here
+    assert.equal(ctx.accounts.verify(idle.token), null, 'an idle device is signed out');
+    ctx.accounts.flush();
+    const raw = readFileSync(ctx.file, 'utf8');
+    assert.ok(!raw.includes(accountTokenHash(idle.token)), 'its hash is deleted from the file, not merely ignored');
+    assert.ok(raw.includes(accountTokenHash(reg.token)), 'the device that keeps playing is untouched');
+    assert.equal(ctx.accounts.stats().tokens, 1);
+    assert.deepEqual(ctx.accounts.verify(reg.token), { playerId: reg.playerId, name: reg.name, email: EMAIL });
+    // …and it expires too once it stops being used for a whole window
+    ctx.clock.now += ACCOUNT.tokenTtlMs + 1;
+    assert.equal(ctx.accounts.verify(reg.token), null);
+    assert.equal(ctx.accounts.stats().tokens, 0);
+  });
+
+  test('expired tokens free their slots, so the 5-token rotation counts live ones only', async () => {
+    const ctx = mk();
+    const first = await signUp(ctx);
+    for (let i = 0; i < ACCOUNT.tokens - 1; i++) await ctx.accounts.login({ email: EMAIL, password: PASSWORD });
+    assert.equal(ctx.accounts.stats().tokens, ACCOUNT.tokens);
+    // all five go stale; a new login must not be evicted by them
+    ctx.clock.now += ACCOUNT.tokenTtlMs + 1;
+    const fresh = await ctx.accounts.login({ email: EMAIL, password: PASSWORD });
+    assert.equal(fresh.ok, true);
+    assert.ok(ctx.accounts.verify(fresh.token), 'the new token lives');
+    assert.equal(ctx.accounts.verify(first.token), null, 'the stale ones are gone');
+    assert.equal(ctx.accounts.stats().tokens, 1, 'and they freed every slot');
+    // the file no longer carries them either
+    ctx.accounts.flush();
+    const doc = JSON.parse(readFileSync(ctx.file, 'utf8'));
+    const [rec] = Object.values(doc.accounts);
+    assert.equal(rec.tokens.length, 1);
+    assert.equal(rec.tokens[0].hash, accountTokenHash(fresh.token));
+  });
+
+  test('a stale token in the file is dropped on load', async () => {
+    const ctx = mk();
+    const reg = await signUp(ctx);
+    ctx.accounts.flush();
+    const stale = createAccounts({ file: ctx.file, smtp: fakeMailer(), log: { info() {}, warn() {}, error() {}, debug() {} }, now: () => ctx.clock.now + ACCOUNT.tokenTtlMs + 1 });
+    assert.equal(stale.verify(reg.token), null, 'the loaded token is already expired');
+    assert.deepEqual(stale.stats(), { accounts: 1, tokens: 0, codes: 0 });
+    const live = createAccounts({ file: ctx.file, smtp: fakeMailer(), log: { info() {}, warn() {}, error() {}, debug() {} }, now: () => ctx.clock.now });
+    assert.ok(live.verify(reg.token), 'the same file is fine for a clock inside the window');
   });
 
   test('logout revokes one token and leaves the others', async () => {

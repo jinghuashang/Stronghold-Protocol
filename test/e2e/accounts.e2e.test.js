@@ -335,6 +335,11 @@ describe('accounts end to end (wired server)', () => {
       assert.equal(sent.ttlSec, 600);
       const resetMail = relay.mails[relay.mails.length - 1];
       assert.match(mailText(resetMail), /密码重置验证码/, 'the reset mail, not a registration one');
+      // an address with no account: the SAME answer, and no mail at all (anti-enumeration, §25.8)
+      const mailsBefore = relay.mails.length;
+      const probe = await auth(stranger, { t: 'auth.requestReset', email: 'nobody@rhodes.example' }, 'auth.resetSent');
+      assert.equal(probe.ttlSec, 600, 'the same resetSent as for an address that has an account');
+      assert.equal(relay.mails.length, mailsBefore, 'and nothing was mailed');
       const code = latestCode(relay);
       const reset = await auth(stranger, { t: 'auth.resetPassword', email: EMAIL3, code, password: 'new-pass-9!' }, 'auth.ok');
       assert.equal(reset.playerId, registered2.playerId, 'the same account, a fresh session');

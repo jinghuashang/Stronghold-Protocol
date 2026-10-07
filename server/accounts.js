@@ -294,10 +294,15 @@ export function createAccounts({ file = path.join(DATA_DIR, 'accounts.json'), sm
   }
 
   /**
-   * Mail a password-reset code. An address without an account answers `unknown_email` — [ASSUMED] deliberately, in the
-   * same style as registration's `email_taken`: telling somebody they have no account here is the honest answer, and
-   * the throttles (`too_many` after one mail a minute) plus the identical successful path keep it from being a useful
-   * account-enumeration oracle. A reset code and a registration code never share storage (see `codeKey`).
+   * Mail a password-reset code — **without disclosing whether the address has an account**: the answer is always
+   * `{ ok: true, ttlSec }` (and `auth.resetSent` is always sent, §8.1), the mail only really goes out when it can,
+   * and nothing about the difference is logged above debug level. The attempt is recorded against the same throttles
+   * for both cases, so the *throttle* behaviour is identical too (a known address would otherwise answer `too_many`
+   * after one mail a minute while an unknown one always answered fine — another oracle).
+   *
+   * [ASSUMED] A residual timing difference remains — an existing address waits for the SMTP conversation while an
+   * unknown one answers at once. Equalising it would mean sleeping for a relay's round trip on every request (a free
+   * DoS on a public endpoint), so the answer is deliberately honest about what it costs: see DESIGN §25.8.
    * @param {unknown} rawEmail @param {{ ip?: string | null }} [opts]
    * @returns {Promise<{ ok: true, ttlSec: number } | { ok: false, error: string }>}
    */
@@ -305,7 +310,17 @@ export function createAccounts({ file = path.join(DATA_DIR, 'accounts.json'), sm
     const email = normalizeEmail(rawEmail);
     if (!email) return { ok: false, error: 'bad_email' };
     if (!smtp) return { ok: false, error: 'accounts_disabled' };
-    if (!byEmail.has(email)) return { ok: false, error: 'unknown_email' };
+    const at = now();
+    const reason = throttled(email, ip, at);
+    if (reason) {
+      log.info(`[accounts] reset code for ${email} throttled (${reason})`);
+      return { ok: false, error: 'too_many' };
+    }
+    if (!byEmail.has(email)) {
+      noteSent(email, ip, at); // counted exactly like a real one: the throttles must not tell the two apart
+      log.debug?.(`[accounts] reset code requested for an address without an account (no mail sent)`);
+      return { ok: true, ttlSec: ACCOUNT.codeTtlSec };
+    }
     return await mailCode(email, 'reset', ip);
   }
 
@@ -402,6 +417,8 @@ export function createAccounts({ file = path.join(DATA_DIR, 'accounts.json'), sm
       adopt(rec);
     }
     if (skipped) log.warn(`[accounts] ${skipped} malformed/duplicate record(s) in ${file} ignored`);
+    const stale = pruneExpired();
+    if (stale) log.info(`[accounts] ${stale} expired token(s) dropped on load`);
     if (byId.size) log.info(`[accounts] loaded ${byId.size} account(s) from ${file}`);
   }
 
@@ -409,6 +426,7 @@ export function createAccounts({ file = path.join(DATA_DIR, 'accounts.json'), sm
 
   /** Write the whole store atomically (temp file + rename). Never throws: a full disk must not kill a login. */
   function persist() {
+    pruneExpired(); // an expired token must never be written back (nor keep a token slot)
     touchDirty = false;
     const accounts = {};
     for (const [playerId, a] of byId) accounts[playerId] = a;
@@ -439,8 +457,32 @@ export function createAccounts({ file = path.join(DATA_DIR, 'accounts.json'), sm
 
   // ---- tokens ---------------------------------------------------------------------------------------------
 
-  /** Mint a token for an account, keeping at most ACCOUNT.tokens (the oldest goes). @param {any} account */
+  /** Expired when it has not been used for ACCOUNT.tokenTtlMs (a sliding window: any `verify` refreshes it). */
+  const isExpired = (record, at) => at - (Number.isFinite(record.lastSeenAt) ? record.lastSeenAt : 0) > ACCOUNT.tokenTtlMs;
+
+  /**
+   * Drop one account's expired tokens (they must not keep occupying ACCOUNT.tokens slots). @returns {number} removed
+   * @param {any} account
+   */
+  function pruneAccount(account) {
+    const at = now();
+    const expired = account.tokens.filter((t) => isExpired(t, at));
+    if (!expired.length) return 0;
+    for (const t of expired) byToken.delete(t.hash);
+    account.tokens = account.tokens.filter((t) => !isExpired(t, at));
+    return expired.length;
+  }
+
+  /** Drop every expired token of every account (after a load, and before a write). @returns {number} removed */
+  function pruneExpired() {
+    let removed = 0;
+    for (const account of byId.values()) removed += pruneAccount(account);
+    return removed;
+  }
+
+  /** Mint a token for an account, keeping at most ACCOUNT.tokens unexpired ones (the oldest goes). */
   function issueToken(account) {
+    pruneAccount(account);
     const token = newAccountToken();
     const at = now();
     const record = { hash: accountTokenHash(token), createdAt: at, lastSeenAt: at };
@@ -454,6 +496,13 @@ export function createAccounts({ file = path.join(DATA_DIR, 'accounts.json'), sm
   function lookup(token) {
     if (typeof token !== 'string' || token.length === 0 || token.length > ACCOUNT.tokenMaxLen) return null;
     return byToken.get(accountTokenHash(token)) || null;
+  }
+
+  /** Drop one token (expired or revoked) and remember that the file has to be rewritten. */
+  function forgetToken(hit) {
+    hit.account.tokens = hit.account.tokens.filter((t) => t !== hit.record);
+    byToken.delete(hit.record.hash);
+    persist();
   }
 
   // ---- API -----------------------------------------------------------------------------------------------
@@ -550,9 +599,7 @@ export function createAccounts({ file = path.join(DATA_DIR, 'accounts.json'), sm
   function logout(token) {
     const hit = lookup(token);
     if (!hit) return false;
-    hit.account.tokens = hit.account.tokens.filter((t) => t !== hit.record);
-    byToken.delete(hit.record.hash);
-    persist();
+    forgetToken(hit);
     return true;
   }
 
@@ -565,6 +612,13 @@ export function createAccounts({ file = path.join(DATA_DIR, 'accounts.json'), sm
     const hit = lookup(token);
     if (!hit) return null;
     const at = now();
+    if (isExpired(hit.record, at)) {
+      // The sliding window elapsed: the credential is gone (from the file too, at once — a signed-out device must not
+      // stay valid in the next process either).
+      forgetToken(hit);
+      log.info(`[accounts] token for ${hit.account.email} expired after ${Math.round(ACCOUNT.tokenTtlMs / 86400000)} day(s)`);
+      return null;
+    }
     hit.account.lastSeenAt = at;
     hit.record.lastSeenAt = at;
     touchDirty = true;
@@ -574,8 +628,9 @@ export function createAccounts({ file = path.join(DATA_DIR, 'accounts.json'), sm
 
   /** @returns {{ accounts: number, tokens: number, codes: number }} */
   function stats() {
+    const at = now();
     let tokens = 0;
-    for (const a of byId.values()) tokens += a.tokens.length;
+    for (const a of byId.values()) tokens += a.tokens.filter((t) => !isExpired(t, at)).length;
     return { accounts: byId.size, tokens, codes: codes.size };
   }
 
