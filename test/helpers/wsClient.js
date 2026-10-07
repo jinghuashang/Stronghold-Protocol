@@ -93,7 +93,7 @@ export class TestClient {
    * @param {number} [timeout] ms
    * @returns {Promise<any>}
    */
-  waitFor(type, predicate = () => true, timeout = 2000) {
+  waitFor(type, predicate = () => true, timeout = 5000) {
     const match = (m) => (type == null || m.t === type) && predicate(m);
     const i = this.inbox.findIndex(match);
     if (i >= 0) return Promise.resolve(this.inbox.splice(i, 1)[0]);

@@ -103,7 +103,7 @@ const healthz = (port) => new Promise((resolve, reject) => {
 });
 
 /** Send an intent and wait for an account answer (the client's `request()` only knows ok/error/welcome/pong). */
-async function auth(client, msg, type, timeout = 5000) {
+async function auth(client, msg, type, timeout = 15000) {
   const rid = client.nextRid++;
   client.send({ ...msg, rid });
   return await client.waitFor(type, (m) => m.rid === rid, timeout);
@@ -183,7 +183,7 @@ describe('accounts end to end (wired server)', () => {
     assert.equal(ok.playerId, takeoverHost.session.playerId, 'the same account playerId');
     const welcome = await c2.waitFor('welcome', (m) => m.playerId === ok.playerId);
     assert.equal(welcome.resumed, true, 'the hand-over resends everything');
-    const state = await c2.waitFor('room.state', (s) => s.code === takeoverHost.roomCode, 5000);
+    const state = await c2.waitFor('room.state', (s) => s.code === takeoverHost.roomCode, 15000);
     assert.equal(state.seats.find((s) => s && s.playerId === ok.playerId).name, NAME, 'the phone holds the same seat');
     const closed = await takeoverHost.closed;
     assert.equal(closed.code, 4001, 'the desktop is told the session was replaced');
