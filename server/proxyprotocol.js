@@ -117,15 +117,25 @@ export function matchProxyHeader(buf) {
   return { status: 'none' };                                        // a plain HTTP request (GET/POST/…) or a TLS record
 }
 
+/** How long a socket may stay silent in 'on' before it is treated as a plain client (see readProxyHeader). */
+const PLAIN_GRACE_MS = 750;
+
 /**
  * Read the optional header from a freshly accepted (paused) socket and hand the rest of the stream to `onReady`.
  * The leftover bytes are pushed back with `socket.unshift`, so the http server parses exactly the original stream.
+ *
+ * 'required' waits `timeoutMs` for the header and closes a socket that never produces one. 'on' is forgiving: the
+ * first byte decides (a PROXY header is parsed, anything else is a plain client), and a socket that sends *nothing*
+ * within `graceMs` (a tunnel's health check, a browser's pre-connect, a client that waits for the server to speak) is
+ * handed to the http server as a direct client — the server's own idle/header timeouts own it from there. Killing
+ * those silent sockets (the old behaviour) broke pre-connected clients and flooded the log.
  * @param {net.Socket} socket @param {'on' | 'required'} mode
- * @param {{ timeoutMs?: number, onHeader?: (info: object | null, socket: net.Socket) => void, log?: object }} [opts]
+ * @param {{ timeoutMs?: number, graceMs?: number, onHeader?: (info: object | null, socket: net.Socket) => void, log?: object }} [opts]
  * @returns {Promise<object | null>} resolves with the parsed info (or null) once the socket may be consumed
  */
 export function readProxyHeader(socket, mode, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 10_000;
+  const graceMs = Math.min(opts.graceMs ?? (mode === 'required' ? timeoutMs : PLAIN_GRACE_MS), timeoutMs);
   return new Promise((resolve, reject) => {
     let buf = Buffer.alloc(0);
     let settled = false;
@@ -134,6 +144,7 @@ export function readProxyHeader(socket, mode, opts = {}) {
       socket.off('error', onError);
       socket.off('close', onClose);
       clearTimeout(timer);
+      clearTimeout(hardTimer);
     };
     const finish = (info, leftover) => {
       if (settled) return;
@@ -173,8 +184,19 @@ export function readProxyHeader(socket, mode, opts = {}) {
     };
     const onError = (e) => fail(`socket error: ${e?.code || e?.message || 'error'}`);
     const onClose = () => fail('socket closed before the proxy protocol header');
-    const timer = setTimeout(() => fail('proxy protocol header timeout'), timeoutMs);
+    const onGrace = () => {
+      if (mode !== 'required' && buf.length === 0) {
+        opts.log?.debug?.(`[proxy] no header within ${graceMs} ms: serving the socket as a direct client`);
+        socket.pause();
+        finish(null, null);
+        return;
+      }
+      fail('proxy protocol header timeout');       // 'required' silence, or a header that never completes
+    };
+    const timer = setTimeout(onGrace, graceMs);
+    const hardTimer = graceMs < timeoutMs ? setTimeout(() => fail('proxy protocol header timeout'), timeoutMs) : null;
     timer.unref?.();
+    hardTimer?.unref?.();
     socket.on('data', onData);
     socket.on('error', onError);
     socket.on('close', onClose);
@@ -198,13 +220,18 @@ export function createProxyProtocolListener(httpServer, opts = {}) {
     socket.on('error', () => {});                       // a client that vanishes mid-header must not crash the server
     readProxyHeader(socket, mode, {
       timeoutMs: opts.timeoutMs,
+      graceMs: opts.graceMs,
       log,
       onHeader: (info, s) => { if (info) s.proxyProtocol = info; },
     }).then(() => {
       httpServer.emit('connection', socket);
       socket.resume();                                  // the http parser pulls what it needs; resume so it can
     }).catch((e) => {
-      if (log) log.warn?.(`[proxy] ${e.message}`);
+      // a probe that connects and closes (tunnel health checks) is normal: keep the log quiet for it
+      if (log) {
+        if (/closed before the proxy protocol header/.test(e.message)) log.debug?.(`[proxy] ${e.message}`);
+        else log.warn(`[proxy] ${e.message}`);
+      }
       socket.destroy();
     });
   });

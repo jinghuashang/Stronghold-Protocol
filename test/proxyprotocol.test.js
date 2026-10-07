@@ -201,6 +201,42 @@ test('the per-network key of a proxied connection is the header address (limits 
   }
 });
 
+test('PROXY_PROTOCOL=on: a socket that stays silent is served as a direct client (health checks, pre-connects)', async () => {
+  const srv = await startServer({ port: 0, quiet: true, log: silent, proxyProtocol: 'on' });
+  try {
+    const out = await new Promise((resolve, reject) => {
+      const socket = net.connect(srv.port, '127.0.0.1', () => {
+        setTimeout(() => socket.write(Buffer.from(HTTP_GET)), 1200);   // longer than the silent grace window
+      });
+      let data = '';
+      socket.on('data', (c) => { data += c.toString('latin1'); if (data.includes('HTTP/')) { socket.destroy(); resolve(data); } });
+      socket.on('error', reject);
+      setTimeout(() => { socket.destroy(); resolve(data); }, 6000);
+    });
+    assert.match(out, /^HTTP\/1\.1 200/, 'the request that arrives after the silence is still answered');
+  } finally {
+    await srv.close();
+  }
+});
+
+test('PROXY_PROTOCOL=required: a silent socket is closed once the timeout passes', async () => {
+  const { createServer } = await import('node:http');
+  const http2 = createServer((req, res) => { res.end('x'); });
+  const listener = createProxyProtocolListener(http2, { mode: 'required', log: silent, timeoutMs: 120, graceMs: 120 });
+  await new Promise((r) => listener.listen(0, '127.0.0.1', r));
+  try {
+    const closed = await new Promise((resolve) => {
+      const socket = net.connect(listener.address().port, '127.0.0.1');
+      socket.on('close', () => resolve('closed'));
+      setTimeout(() => { socket.destroy(); resolve('open'); }, 1500);
+    });
+    assert.equal(closed, 'closed', 'required: no header, no service');
+  } finally {
+    await new Promise((r) => listener.close(r));
+    http2.close();
+  }
+});
+
 test('createProxyProtocolListener: it is a net.Server that can be closed on its own', async () => {
   const { createServer } = await import('node:http');
   const http2 = createServer(() => {});
