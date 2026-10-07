@@ -412,16 +412,18 @@ describe('accounts: registration & login', () => {
     assert.equal(validAccountPassword('a'.repeat(ACCOUNT.passwordMax + 1)), false);
     ctx.clock.now += ACCOUNT.resendSec * 1000;
     const code = await codeFor(ctx);
-    assert.deepEqual(await ctx.accounts.register({ email: EMAIL, code, name: '阿米', password: PASSWORD }), { ok: false, error: 'bad_name' });
+    assert.deepEqual(await ctx.accounts.register({ email: EMAIL, code, name: '   ', password: PASSWORD }), { ok: false, error: 'bad_name' });
     // the code was spent on that attempt (verifyCode comes first, so an address must prove itself before anything else)
     assert.deepEqual(await ctx.accounts.register({ email: EMAIL, code, name: '阿米娅', password: PASSWORD }), { ok: false, error: 'code_expired' });
     assert.equal(ctx.accounts.stats().accounts, 0);
     assert.equal(normalizeNickname('  阿米娅  '), '阿米娅', 'trimmed like net.js sanitizeName');
     assert.equal(normalizeNickname('a\u0000bcd'), 'abcd', 'control characters stripped, like sanitizeName');
     assert.equal(normalizeNickname('阿米 娅'), '阿米 娅', 'an inner space is kept (the nickname is only a display name)');
+    assert.equal(normalizeNickname('甲'), '甲', 'one character is a nickname (官方 1–12)');
     assert.equal(normalizeNickname('a'.repeat(ACCOUNT.nameMax)), 'aaaaaaaaaaaa');
     assert.equal(normalizeNickname('a'.repeat(ACCOUNT.nameMax + 1)), null, 'longer than a session name could carry');
-    for (const bad of ['', 'ab', '阿米', 42, null, undefined]) assert.equal(normalizeNickname(bad), null, JSON.stringify(bad));
+    for (const bad of ['', '   ', 'a'.repeat(ACCOUNT.nameMax + 1), 42, null, undefined]) assert.equal(normalizeNickname(bad), null, JSON.stringify(bad));
+    for (const ok of ['甲', '阿米', 'ab', 'a']) assert.equal(normalizeNickname(ok), ok, JSON.stringify(ok));
     assert.equal(sanitizeName('  阿米娅  '), '阿米娅');
   });
 
@@ -622,7 +624,7 @@ describe('accounts: the title panel stands on its own (static)', () => {
 
   test('完成注册 depends on the panel fields alone, and says what is missing', () => {
     assert.ok(src.includes('disabled=${busy || !codeOk || !password || (isRegister && !nickOk)}'), 'the enable condition');
-    assert.ok(src.includes('const nickOk = [...nick].length >= ACCOUNT.nameMin'), 'the 3-character rule');
+    assert.ok(src.includes('const nickOk = [...nick].length >= ACCOUNT.nameMin'), 'the minimum comes from ACCOUNT (1–12)');
     assert.ok(src.includes('请输入昵称（${ACCOUNT.nameMin}–${ACCOUNT.nameMax} 字）'), 'an explicit reason when it is empty');
     assert.ok(src.includes('填写上方的昵称即可完成注册'), 'the reason is repeated next to the button');
     assert.ok(src.includes('昵称需 ${ACCOUNT.nameMin}–${ACCOUNT.nameMax} 字，当前 ${[...nick].length} 字'), 'and when it is too short');
@@ -639,6 +641,8 @@ describe('accounts: protocol (shared/protocol.js)', () => {
   test('the wire accepts exactly what the module accepts', () => {
     assert.equal(validateC2S({ t: 'auth.requestCode', email: EMAIL }), null);
     assert.equal(validateC2S({ t: 'auth.register', email: EMAIL, code: '123456', name: '阿米娅', password: PASSWORD }), null);
+    assert.equal(validateC2S({ t: 'auth.register', email: EMAIL, code: '123456', name: '甲', password: PASSWORD }), null, 'one character (官方 1–12)');
+    assert.equal(validateC2S({ t: 'auth.register', email: EMAIL, code: '123456', name: 'ab', password: PASSWORD }), null, 'two characters too');
     assert.equal(validateC2S({ t: 'auth.login', email: EMAIL, password: PASSWORD }), null);
     assert.equal(validateC2S({ t: 'auth.logout' }), null);
     assert.equal(S2C.includes('auth.codeSent'), true, 'auth.codeSent is a documented push');
@@ -650,8 +654,9 @@ describe('accounts: protocol (shared/protocol.js)', () => {
       { t: 'auth.register', email: EMAIL, code: '12345', name: '阿米娅', password: PASSWORD },
       { t: 'auth.register', email: EMAIL, code: '12345a', name: '阿米娅', password: PASSWORD },
       { t: 'auth.register', email: EMAIL, code: 123456, name: '阿米娅', password: PASSWORD },
-      { t: 'auth.register', email: EMAIL, code: '123456', name: '阿米', password: PASSWORD },
+      { t: 'auth.register', email: EMAIL, code: '123456', name: '', password: PASSWORD },
       { t: 'auth.register', email: EMAIL, code: '123456', name: 'a'.repeat(ACCOUNT.nameMax + 1), password: PASSWORD },
+      { t: 'auth.register', email: EMAIL, code: '123456', name: ' x', password: PASSWORD },
       { t: 'auth.register', email: EMAIL, code: '123456', name: '阿米娅', password: 'short' },
       { t: 'auth.register', email: EMAIL, code: '123456', name: '阿米娅' },
       { t: 'auth.register', email: EMAIL, code: '123456', password: PASSWORD },

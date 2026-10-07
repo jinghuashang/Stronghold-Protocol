@@ -251,7 +251,7 @@ const target = (v) => {
  * wrong tries void the code.
  */
 export const ACCOUNT = Object.freeze({
-  nameMin: 3,
+  nameMin: 1,
   nameMax: NAME_MAX_LEN, // 12
   passwordMin: 6,
   passwordMax: 128,

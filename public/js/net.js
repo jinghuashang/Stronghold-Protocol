@@ -101,7 +101,7 @@ export const AUTH_ERR_TEXT = Object.freeze(Object.assign(Object.create(null), {
   too_many: '发送过于频繁，请稍后再试',
   smtp_failed: '验证码邮件发送失败，请稍后再试',
   accounts_disabled: '当前服务器未开启账号系统，请以游客身份开始',
-  bad_name: '代号需 3–12 字',
+  bad_name: '代号需 1–12 字',
   bad_password: '密码至少 6 位（最多 128 位）',
   bad_credentials: '邮箱或密码不正确',
   bad_token: '账号登录已失效，请重新登录',

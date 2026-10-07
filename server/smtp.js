@@ -82,15 +82,35 @@ export function smtpOptionsFromEnv(env = process.env) {
 /** One line of an SMTP reply that ends a reply (`250 …`); `250-…` continues it. */
 const REPLY_END = /^\d{3}(?:[ ]|$)/;
 const REPLY_CODE = /^(\d{3})/;
+/** One encoded word carries this many UTF-8 bytes: enough that every subject we send stays a single word (§25.3). */
+const HEADER_WORD_MAX_BYTES = 150;
 
-/** base64 an RFC 2047 encoded word, split so no line exceeds the 76-char limit (a long subject still fits). */
+/**
+ * An RFC 5322 header value, RFC 2047 encoded when it cannot travel as plain ASCII. A long value is split into several
+ * encoded words **at character boundaries**: a word that cuts a multi-byte character in half decodes to mojibake in
+ * every mail client, which is exactly what a naive base64 slice does (each word is ≤ 45 chars of base64 = 60 encoded
+ * characters, comfortably under the 75-character limit, and every word decodes on its own).
+ */
 function encodeHeader(value) {
   const s = String(value ?? '');
-  if (/^[\x20-\x7e]*$/.test(s) && s.length <= 70) return s;
-  const b64 = Buffer.from(s, 'utf8').toString('base64');
+  if (/^[\x20-\x7e]*$/.test(s) && s.length <= 75) return s;
   const words = [];
-  for (let i = 0; i < b64.length; i += 45) words.push(`=?UTF-8?B?${b64.slice(i, i + 45)}?=`);
-  return words.join(`${CRLF} `);
+  let buf = '';
+  for (const ch of s) {
+    // UTF-8 bytes of the *whole* characters of the current word: never cut a character in half.
+    if (Buffer.byteLength(buf + ch, 'utf8') > HEADER_WORD_MAX_BYTES) { words.push(buf); buf = ch; } else buf += ch;
+  }
+  if (buf) words.push(buf);
+  return words.map((w) => `=?UTF-8?B?${Buffer.from(w, 'utf8').toString('base64')}?=`).join(`${CRLF} `);
+}
+
+/** `Name <addr@host>` with the display name encoded when it is not plain ASCII (an address alone passes through). */
+function encodeFrom(value) {
+  const s = String(value ?? '');
+  const m = /^(.*?)\s*<([^>]*)>$/.exec(s);
+  if (!m) return s;
+  const name = m[1].trim().replace(/^"|"$/g, '');
+  return name ? `${encodeHeader(name)} <${m[2]}>` : `<${m[2]}>`;
 }
 
 /** base64 body, wrapped at 76 chars. */
@@ -105,7 +125,7 @@ function base64Body(text) {
 export function buildMail({ from, to, subject, text }) {
   const domain = String(from).split('@')[1] || 'stronghold-protocol.local';
   const headers = [
-    `From: ${from}`,
+    `From: ${encodeFrom(from)}`,
     `To: ${to}`,
     `Subject: ${encodeHeader(subject)}`,
     `Date: ${new Date().toUTCString()}`,

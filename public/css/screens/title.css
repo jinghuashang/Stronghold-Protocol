@@ -5,6 +5,23 @@
 
 .title-screen { align-items: center; justify-content: center; }
 
+/* The title's own scrolling area (public/js/screens/title.js wraps .title-main in it, the same pattern as
+   .screen__scroll on other screens). A short viewport — a phone in landscape, a 720p-tall desktop window — used to cut
+   the account panel off below the fold with no way to reach 完成注册 except the Tab key. The wrapper is a centred flex
+   column and the panel uses `margin: auto`, which centres it whenever it fits and lets the whole panel scroll into view
+   when it does not (auto margins never clip the top the way justify-content: center does inside an overflow box).
+   The backdrop, the corner labels, the footer and the modal host stay outside this wrapper, so they keep their exact
+   place and no scrollbar appears in a tall window. */
+.title-screen__scroll {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-bottom: .12rem;
+  -webkit-overflow-scrolling: touch;
+}
+.title-screen__scroll > .title-main { margin: auto 0; }
+
 /* ---- backdrop ----------------------------------------------------------------------------------- */
 .title-bg { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
 .title-bg__art {

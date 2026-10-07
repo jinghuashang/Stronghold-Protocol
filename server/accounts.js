@@ -142,7 +142,7 @@ export function normalizeEmail(raw) {
 
 /**
  * The nickname an account registers with: net.js's `sanitizeName` (NFC, control/invisible characters stripped,
- * whitespace collapsed, trimmed) bounded by ACCOUNT.nameMin..nameMax. Returns null when the input cannot be one.
+ * whitespace collapsed, trimmed) bounded by ACCOUNT.nameMin..nameMax (1–12: 官方昵称规则 / the official nickname rule). Returns null when the input cannot be one.
  * @param {unknown} raw
  * @returns {string | null}
  */

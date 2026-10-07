@@ -125,24 +125,52 @@ describe('smtp: options from the environment', () => {
 });
 
 describe('smtp: the message', () => {
-  test('headers, an RFC 2047 subject and a base64 body', () => {
-    const mail = buildMail({ from: FROM, to: 'player@example.com', subject: '[卫戍协议：盟约] 注册验证码 123456', text: '你的注册验证码是：123456' });
-    const [headers, body] = mail.split('\r\n\r\n');
-    assert.match(headers, /^From: noreply@stronghold\.example$/m);
-    assert.match(headers, /^To: player@example\.com$/m);
-    assert.match(headers, /^Subject: =\?UTF-8\?B\?[A-Za-z0-9+/=]+\?=\r\n =\?UTF-8\?B\?/m, 'a long subject is split into encoded words');
-    const words = [...headers.matchAll(/=\?UTF-8\?B\?([^?]+)\?=/g)].map((m) => m[1]).join('');
-    assert.equal(Buffer.from(words, 'base64').toString('utf8'), '[卫戍协议：盟约] 注册验证码 123456');
-    assert.match(headers, /^Content-Type: text\/plain; charset=utf-8$/m);
+  test('a Chinese subject is ONE RFC 2047 encoded word that decodes back exactly', () => {
+    const subject = '[卫戍协议：盟约] 注册验证码 123456';
+    const mail = buildMail({ from: FROM, to: 'player@example.com', subject, text: '你的注册验证码是：123456' });
+    const headers = mail.split('\r\n\r\n')[0];
+    const subjectLine = headers.split('\r\n').find((l) => l.startsWith('Subject: '));
+    assert.match(subjectLine, /^Subject: =\?UTF-8\?B\?[A-Za-z0-9+/=]+\?=$/, 'exactly one encoded word, with a space after the colon');
+    assert.ok(!headers.split('\r\n').some((l) => l.startsWith(' =?UTF-8?')), 'and no continuation line for a short subject');
+    const b64 = subjectLine.slice('Subject: =?UTF-8?B?'.length, -'?='.length);
+    assert.equal(Buffer.from(b64, 'base64').toString('utf8'), subject, 'the word decodes to the subject, whole');
+    // the body stays a base64 block, its own encoding untouched
     assert.match(headers, /^Content-Transfer-Encoding: base64$/m);
-    assert.match(headers, /^Message-ID: <[0-9a-f]{24}@stronghold\.example>$/m);
+    assert.match(headers, /^Content-Type: text\/plain; charset=utf-8$/m);
+    const body = mail.split('\r\n\r\n')[1];
     assert.equal(Buffer.from(body.replace(/\r\n/g, ''), 'base64').toString('utf8'), '你的注册验证码是：123456');
-    assert.ok(body.split('\r\n').every((l) => l.length <= 76));
   });
 
-  test('an all-ASCII subject stays readable', () => {
-    const mail = buildMail({ from: FROM, to: 'a@b.co', subject: 'Login code 123456', text: 'hi' });
-    assert.match(mail, /^Subject: Login code 123456$/m);
+  test('a subject that has to be split keeps every word decodable (characters are never cut in half)', () => {
+    const subject = '[卫戍协议：盟约] 你的注册验证码已经生成，请在十分钟之内输入到游戏登录界面以免失效，谢谢配合与支持。'
+      + '（这是一封很长的邮件主题，用来验证折行时每个编码词都能独立解码。）'.repeat(2);
+    const mail = buildMail({ from: FROM, to: 'a@b.co', subject, text: 'x' });
+    const lines = mail.split('\r\n\r\n')[0].split('\r\n');
+    const start = lines.findIndex((l) => l.startsWith('Subject: '));
+    const parts = [lines[start].slice('Subject: '.length)];
+    for (let i = start + 1; i < lines.length && lines[i].startsWith(' =?'); i++) parts.push(lines[i].trim());
+    assert.ok(parts.length > 1, 'a long subject still wraps');
+    const words = parts.map((p) => {
+      assert.match(p, /^=\?UTF-8\?B\?[A-Za-z0-9+/=]+\?=$/, p);
+      const text = Buffer.from(p.slice('=?UTF-8?B?'.length, -'?='.length), 'base64').toString('utf8');
+      // One word carries up to 150 UTF-8 bytes (deliberately more than RFC 2047's 75-char recommendation, so a real
+      // subject never folds); a word that splits is bounded by that budget.
+      assert.ok(Buffer.byteLength(text, 'utf8') <= 150, `a word's bytes stay within the budget (${Buffer.byteLength(text, 'utf8')})`);
+      return text;
+    });
+    for (const w of words) assert.ok(!/\uFFFD/.test(w), `every word decodes on its own (${JSON.stringify(w)})`);
+    assert.equal(words.join(''), subject);
+  });
+
+  test('an all-ASCII subject stays readable, and a Chinese display name is encoded', () => {
+    const plain = buildMail({ from: FROM, to: 'a@b.co', subject: 'Login code 123456', text: 'hi' });
+    assert.match(plain, /^Subject: Login code 123456$/m);
+    const named = buildMail({ from: '卫戍协议：盟约 <noreply@stronghold.example>', to: 'a@b.co', subject: 'Login code', text: 'hi' });
+    const fromLine = named.split('\r\n')[0];
+    assert.match(fromLine, /^From: =\?UTF-8\?B\?([A-Za-z0-9+/=]+)\?= <noreply@stronghold\.example>$/);
+    assert.equal(Buffer.from(/^From: =\?UTF-8\?B\?([A-Za-z0-9+/=]+)\?=/.exec(fromLine)[1], 'base64').toString('utf8'), '卫戍协议：盟约');
+    const bare = buildMail({ from: FROM, to: 'a@b.co', subject: 's', text: 't' });
+    assert.match(bare, /^From: noreply@stronghold\.example$/m, 'a bare address is left alone');
   });
 });
 

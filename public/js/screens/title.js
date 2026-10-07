@@ -525,6 +525,7 @@ export function TitleScreen() {
       <${MicroLabel} tone="hi">TARGET POINT<//><br /><${MicroLabel}>STRONGHOLD PROTOCOL<//>
     </div>
 
+    <div class="screen__scroll title-screen__scroll">
     <main class="title-main">
       <${Emblem} />
       <div class="title-en">
@@ -555,6 +556,7 @@ export function TitleScreen() {
         </div>
       </div>
     </main>
+    </div>
 
     <${SettingsModal} open=${settingsOpen} onClose=${() => setSettingsOpen(false)} />
 
