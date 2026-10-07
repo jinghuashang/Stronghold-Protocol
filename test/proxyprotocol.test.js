@@ -9,7 +9,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import { once } from 'node:events';
-import { parseProxyProtocol, matchProxyHeader, createProxyProtocolListener } from '../server/proxyprotocol.js';
+import { parseProxyProtocol, matchProxyHeader, createProxyProtocolListener, parseTrustList, ipInTrustList } from '../server/proxyprotocol.js';
 import { startServer } from '../server/index.js';
 import { clientAddress, limitKeyOf } from '../server/net.js';
 
@@ -235,6 +235,37 @@ test('PROXY_PROTOCOL=required: a silent socket is closed once the timeout passes
     await new Promise((r) => listener.close(r));
     http2.close();
   }
+});
+
+test('a PROXY header from an untrusted peer is refused (the header itself has no authentication)', async () => {
+  const { createServer } = await import('node:http');
+  const http2 = createServer((req, res) => { res.end('direct'); });
+  // trust list without loopback: the test client connects from 127.0.0.1, i.e. from an untrusted peer
+  const listener = createProxyProtocolListener(http2, { mode: 'on', log: silent, trust: parseTrustList('10.0.0.1') });
+  await new Promise((r) => listener.listen(0, '127.0.0.1', r));
+  try {
+    const port = listener.address().port;
+    const forged = await rawExchange(port, Buffer.concat([V1('198.51.100.7', 1234), Buffer.from(HTTP_GET)]));
+    assert.equal(forged, '', 'a forged header from an untrusted peer is dropped, not honoured');
+    const direct = await rawExchange(port, Buffer.from(HTTP_GET));
+    assert.match(direct, /^HTTP\/1\.1 200/, 'the same peer without a header is still a normal direct client');
+  } finally {
+    await new Promise((r) => listener.close(r));
+    http2.close();
+  }
+});
+
+test('parseTrustList / ipInTrustList: IPv4, CIDR, IPv6 and the default loopback list', () => {
+  const def = parseTrustList();
+  assert.ok(def.valid);
+  assert.ok(ipInTrustList('127.0.0.1', def) && ipInTrustList('127.9.9.9', def), '127.0.0.1/8 covers the loopback block');
+  assert.ok(ipInTrustList('::1', def) && ipInTrustList('::ffff:127.0.0.1', def), 'IPv6 loopback and IPv4-mapped forms');
+  assert.ok(!ipInTrustList('192.168.1.5', def) && !ipInTrustList('203.0.113.9', def), 'anything else is not trusted by default');
+  const lan = parseTrustList('192.168.0.0/16, 10.0.0.5, fd00::/8');
+  assert.ok(lan.valid && ipInTrustList('192.168.31.199', lan) && ipInTrustList('10.0.0.5', lan) && ipInTrustList('fd00::1234', lan));
+  assert.ok(!ipInTrustList('10.0.0.6', lan) && !ipInTrustList('203.0.113.9', lan), 'exact addresses and /8 only match themselves');
+  assert.ok(!parseTrustList('not-an-ip, 10.0.0.0/33').valid, 'malformed entries are reported');
+  assert.equal(parseTrustList('not-an-ip, 10.0.0.1').entries.length, 1, 'the usable entry survives');
 });
 
 test('createProxyProtocolListener: it is a net.Server that can be closed on its own', async () => {

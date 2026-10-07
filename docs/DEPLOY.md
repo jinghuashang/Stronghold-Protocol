@@ -209,6 +209,7 @@ PROXY_PROTOCOL=required npm start   # 必须有 PROXY 头：直连会被直接�
 
 - 支持 v1（`PROXY TCP4/TCP6/UNKNOWN`）与 v2（二进制签名）；`UNKNOWN` / v2 的 `LOCAL`（负载均衡器自己的健康检查）不提供地址，仍按对端地址计。
 - 与 `TRUST_PROXY` 不冲突：PROXY 头的地址**优先于** `CF-Connecting-IP` / `X-Real-IP` / `X-Forwarded-For`。
+- **安全（重要）**：PROXY 头本身没有身份验证——任何能连上端口的客户端都能伪造源地址。因此服务器只会接受来自 `PROXY_PROTOCOL_TRUST` 的头（默认 `127.0.0.1/8,::1/128`，即本机的均衡器 / frp 客户端）；其它来源的连接如果带头发会被**直接断开**（日志里有 `untrusted peer`），不带头的直连照常按真实对端地址服务。均衡器在另一台机器上时：把它的地址写进 `PROXY_PROTOCOL_TRUST`（例如 `10.0.0.5,192.168.0.0/16`），并用防火墙把游戏端口只开放给均衡器。
 - 用 `required` 时把游戏端口只对本机 / 均衡器开放（例如 `HOST=127.0.0.1` 或防火墙），否则绕过均衡器直连的客户端会被断开。
 
 均衡器示例：

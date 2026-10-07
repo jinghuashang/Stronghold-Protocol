@@ -21,7 +21,9 @@
 //   * Env: PORT (default 3000), HOST (default 0.0.0.0), TRUST_PROXY ('auto' default: honour CF-Connecting-IP /
 //     X-Real-IP / X-Forwarded-For only from loopback/private peers such as a local cloudflared; '1' always; '0' never);
 //     PROXY_PROTOCOL ('off' default; 'on' accepts a HAProxy PROXY-protocol v1/v2 header and prefers its source address
-//     over every forwarding header; 'required' also closes connections that carry none — see server/proxyprotocol.js).
+//     over every forwarding header; 'required' also closes connections that carry none — see server/proxyprotocol.js);
+//     PROXY_PROTOCOL_TRUST = who may send that header (comma-separated IPs/CIDRs, default 127.0.0.1/8,::1/128 — the
+//     header is unauthenticated by design, so a public port must not accept it from anywhere).
 //     ACCOUNTS ('off' DEFAULT: no registration/sign-in | 'auto': on when the SMTP settings are complete |
 //     'on' (alias 'required'): accounts are asked for, an incomplete SMTP configuration refuses to start) +
 //     SMTP_HOST/SMTP_PORT/SMTP_SECURE/SMTP_USER/
@@ -49,7 +51,7 @@ import { Lobby } from './lobby.js';
 import { getData, loadData } from './data.js';
 import { PROTOCOL_VERSION, APP_VERSION } from '../shared/constants.js';
 import { MEDIA_PREFIX, AUDIO_EXTS } from '../shared/media.js';
-import { parseProxyProtocol, createProxyProtocolListener } from './proxyprotocol.js';
+import { parseProxyProtocol, createProxyProtocolListener, parseTrustList, PROXY_TRUST_DEFAULT } from './proxyprotocol.js';
 import { accountsConfigState, createAccounts } from './accounts.js';
 import { createSmtp } from './smtp.js';
 import { loadEnvFile } from './envfile.js';
@@ -730,8 +732,16 @@ export async function startServer(opts = {}) {
   // PROXY protocol (server/proxyprotocol.js): with PROXY_PROTOCOL=on|required the process listens on a net.Server
   // that peeks HAProxy's v1/v2 header first and then feeds the socket to the http server (HTTP + /ws both), so
   // net.js clientAddress can use the real client address the balancer sent instead of a forwarding header.
+  // The header is unauthenticated by design, so it is only honoured from `PROXY_PROTOCOL_TRUST` (default: loopback —
+  // the frp client / reverse proxy on this machine); from anywhere else a header is refused and the connection drop.
   const proxyMode = opts.proxyProtocol ?? parseProxyProtocol(process.env.PROXY_PROTOCOL);
-  const listener = proxyMode === 'off' ? server : createProxyProtocolListener(server, { mode: proxyMode, log });
+  const proxyTrustSpec = opts.proxyProtocolTrust ?? process.env.PROXY_PROTOCOL_TRUST ?? PROXY_TRUST_DEFAULT;
+  const proxyTrust = parseTrustList(proxyTrustSpec);
+  if (proxyMode !== 'off') {
+    if (!proxyTrust.valid) log.warn(`[proxy] PROXY_PROTOCOL_TRUST: ${proxyTrust.entries.length} usable entr${proxyTrust.entries.length === 1 ? 'y' : 'ies'} (unparsable items ignored)`);
+    log.info(`[proxy] PROXY protocol ${proxyMode}: headers accepted from ${proxyTrustSpec}`);
+  }
+  const listener = proxyMode === 'off' ? server : createProxyProtocolListener(server, { mode: proxyMode, log, trust: proxyTrust });
 
   const wss = new WebSocketServer({ noServer: true, maxPayload: WS_MAX_PAYLOAD, perMessageDeflate: false, clientTracking: false });
   wss.on('connection', (ws, req) => network.handleConnection(ws, req));

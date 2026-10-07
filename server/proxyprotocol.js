@@ -43,6 +43,89 @@ export function parseProxyProtocol(value) {
   return 'off';
 }
 
+/**
+ * Where a PROXY header may come from. The protocol itself has no authentication: any client that can reach the port
+ * can send one, so a public port would let anyone claim any source address (and dodge the per-network limits). The
+ * header is therefore only honoured when the TCP peer is in this list — by default loopback, which covers the usual
+ * deployment (the frp client / reverse proxy runs on the same machine). A balancer on another host: list its address
+ * in `PROXY_PROTOCOL_TRUST` (e.g. `10.0.0.5,192.168.0.0/16`).
+ */
+export const PROXY_TRUST_DEFAULT = '127.0.0.1/8,::1/128';
+
+/** `::ffff:1.2.3.4` → `1.2.3.4`; otherwise the input, trimmed and lower-cased. */
+function plainIp(ip) {
+  const s = String(ip || '').trim();
+  const m = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(s);
+  return (m ? m[1] : s).toLowerCase();
+}
+
+/** `a.b.c.d` or an IPv6 text form → a byte array (4 or 16), or null. */
+function ipBytes(ip) {
+  const s = plainIp(ip);
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(s)) {
+    const parts = s.split('.').map(Number);
+    if (parts.some((n) => n > 255)) return null;
+    return Buffer.from(parts);
+  }
+  if (!s.includes(':')) return null;
+  const [head, tail = ''] = s.split('::');
+  const groups = (x) => (x ? x.split(':') : []);
+  const h = groups(head), t = groups(tail);
+  if (s.split('::').length > 2) return null;
+  const filled = t.length ? [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t] : [...h, ...Array(8 - h.length).fill('0')];
+  if (filled.length !== 8) return null;
+  const out = Buffer.alloc(16);
+  for (let i = 0; i < 8; i++) {
+    if (!/^[0-9a-f]{1,4}$/.test(filled[i])) return null;
+    out.writeUInt16BE(parseInt(filled[i], 16), i * 2);
+  }
+  return out;
+}
+
+/** One list entry (`1.2.3.4`, `10.0.0.0/8`, `::1`, `fd00::/8`) → `{ bytes, bits }` or null when malformed. */
+function parseTrustEntry(raw) {
+  const s = plainIp(raw);
+  if (!s) return null;
+  const [addr, prefix] = s.split('/');
+  const bytes = ipBytes(addr);
+  if (!bytes) return null;
+  const max = bytes.length * 8;
+  const bits = prefix === undefined ? max : Number(prefix);
+  if (!Number.isInteger(bits) || bits < 0 || bits > max) return null;
+  return { bytes, bits };
+}
+
+/**
+ * Parse `PROXY_PROTOCOL_TRUST` (comma/space separated) into a list; entries that do not parse are ignored.
+ * @param {string} [spec] @returns {{ entries: Array<{ bytes: Buffer, bits: number }>, valid: boolean }}
+ */
+export function parseTrustList(spec = PROXY_TRUST_DEFAULT) {
+  const raw = String(spec ?? '').split(/[\s,]+/).filter(Boolean);
+  const entries = [];
+  let valid = raw.length > 0;
+  for (const r of raw) {
+    const e = parseTrustEntry(r);
+    if (e) entries.push(e); else valid = false;
+  }
+  return { entries, valid };
+}
+
+/** Is `ip` (a socket peer address) inside the parsed trust list? */
+export function ipInTrustList(ip, list) {
+  const bytes = ipBytes(ip);
+  if (!bytes) return false;
+  for (const e of list.entries) {
+    if (e.bytes.length !== bytes.length) continue;
+    let ok = true;
+    for (let i = 0; i < e.bits; i++) {
+      const mask = 0x80 >> (i % 8);
+      if ((bytes[i >> 3] & mask) !== (e.bytes[i >> 3] & mask)) { ok = false; break; }
+    }
+    if (ok) return true;
+  }
+  return false;
+}
+
 /** Parse one v1 line (`TCP4` / `TCP6` / `UNKNOWN`); returns matchProxyHeader's result shape. */
 function parseV1(buf) {
   const nl = buf.indexOf(0x0a);
@@ -168,6 +251,7 @@ export function readProxyHeader(socket, mode, opts = {}) {
         return;
       }
       if (m.status === 'ok') {
+        if (opts.trusted === false) { fail('proxy protocol header from an untrusted peer'); return; }
         // stop reading before the http server takes over: further chunks wait in the kernel, so the leftover bytes
         // unshifted below are the first thing the parser sees (order preserved)
         socket.pause();
@@ -208,12 +292,16 @@ export function readProxyHeader(socket, mode, opts = {}) {
  * A net.Server that peeks the PROXY protocol header and then feeds the socket to `httpServer` (HTTP + /ws upgrade
  * both travel through it). Listen on the returned server instead of the http server; everything else is unchanged —
  * the http server keeps its request listener, `clientError` handler, `upgrade` handling and admission checks.
+ * The header is only honoured from a peer inside `trust` (see PROXY_TRUST_DEFAULT): elsewhere it is refused, because
+ * anyone who can reach the port could otherwise claim a source address.
  * @param {import('node:http').Server} httpServer
- * @param {{ mode?: 'on' | 'required', log?: object, timeoutMs?: number }} [opts]
+ * @param {{ mode?: 'on' | 'required', log?: object, timeoutMs?: number, graceMs?: number,
+ *           trust?: ReturnType<typeof parseTrustList> }} [opts]
  */
 export function createProxyProtocolListener(httpServer, opts = {}) {
   const mode = opts.mode === 'required' ? 'required' : 'on';
   const log = opts.log || null;
+  const trust = opts.trust ?? parseTrustList(PROXY_TRUST_DEFAULT);
   // allowHalfOpen like the http server's own listener: a client that sends its request and half-closes (FIN) must
   // still get the answer — with the net.Server default (false) the socket would be ended before the response.
   const listener = net.createServer({ pauseOnConnect: true, allowHalfOpen: true }, (socket) => {
@@ -221,6 +309,7 @@ export function createProxyProtocolListener(httpServer, opts = {}) {
     readProxyHeader(socket, mode, {
       timeoutMs: opts.timeoutMs,
       graceMs: opts.graceMs,
+      trusted: ipInTrustList(socket.remoteAddress, trust),
       log,
       onHeader: (info, s) => { if (info) s.proxyProtocol = info; },
     }).then(() => {
